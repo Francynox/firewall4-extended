@@ -825,6 +825,7 @@ return {
 		// Build list of forwardings
 		//
 
+		map(filter(this.state.ubus_rules, f => (f.type == "forwarding")), f => self.parse_forwarding(f));
 		this.cursor.foreach("firewall", "forwarding", f => self.parse_forwarding(f));
 
 

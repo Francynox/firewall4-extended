@@ -1,8 +1,8 @@
-Testing that fw4 zones and rules declared ephemerally through procd service
-data (service get_data type firewall) are synthesized with their declared
-names and resolve against uci zones, that an entry without a type field
-remains inert, and that a malformed zone is skipped with a diagnostic while
-the rest of the ruleset stays intact.
+Testing that fw4 zones, forwardings and rules declared ephemerally through
+procd service data (service get_data type firewall) are synthesized with their
+declared names, resolve against uci zones in both directions, that an entry
+without a type field remains inert, and that a malformed zone is skipped with
+a diagnostic while the rest of the ruleset stays intact.
 
 -- Testcase --
 {%
@@ -81,6 +81,11 @@ the rest of the ruleset stays intact.
 					"masq": "1",
 					"mtu_fix": "1",
 					"network": [ "cn_ha" ]
+				},
+				{
+					"type": "forwarding",
+					"src": "cz_ha",
+					"dest": "wan"
 				},
 				{
 					"type": "rule",
@@ -222,7 +227,7 @@ table inet fw4 {
 	}
 
 	chain input_cz_ha {
-		udp dport 53 counter accept comment "!fw4: ubus:container[cn_ha] rule 1"
+		udp dport 53 counter accept comment "!fw4: ubus:container[cn_ha] rule 2"
 		jump reject_from_cz_ha
 	}
 
@@ -231,6 +236,7 @@ table inet fw4 {
 	}
 
 	chain forward_cz_ha {
+		jump accept_to_wan comment "!fw4: ubus:container[cn_ha] forwarding 1"
 		jump reject_to_cz_ha
 	}
 
