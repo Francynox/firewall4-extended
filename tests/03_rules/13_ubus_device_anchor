@@ -1,0 +1,311 @@
+Testing that a per-interface ubus data.firewall rule carrying src/dest zone
+references is pinned to the publishing interface device (the netifd protocol
+handler contract, e.g. 464xlat), while a rule that opts out with an empty
+device ("device": "") instead resolves through its zone references. A rule
+opting out without any zone reference would end up unscoped in a base chain
+and is rejected with a diagnostic.
+
+-- Testcase --
+{%
+	include("./root/usr/share/firewall4/main.uc", {
+		getenv: function(varname) {
+			switch (varname) {
+			case 'ACTION':
+				return 'print';
+			}
+		}
+	})
+%}
+-- End --
+
+-- File uci/helpers.json --
+{}
+-- End --
+
+-- File fs/open~_sys_class_net_br-lan_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_pppoe-wan_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_tun0_flags.txt --
+0x1103
+-- End --
+
+-- File ubus/network.interface~dump.json --
+{
+	"interface": [
+		{
+			"interface": "lan",
+			"up": true,
+			"l3_device": "br-lan",
+			"proto": "static",
+			"device": "br-lan",
+			"ipv4-address": [ { "address": "192.168.1.1", "mask": 24 } ],
+			"data": {}
+		},
+		{
+			"interface": "wan",
+			"up": true,
+			"l3_device": "pppoe-wan",
+			"proto": "pppoe",
+			"device": "eth1",
+			"ipv4-address": [ { "address": "10.11.12.194", "mask": 24 } ],
+			"data": {}
+		},
+		{
+			"interface": "tun",
+			"up": true,
+			"l3_device": "tun0",
+			"proto": "none",
+			"device": "tun0",
+			"data": {
+				"zone": "wan",
+				"firewall": [
+					{
+						"type": "rule",
+						"src": "wan",
+						"dest": "lan",
+						"proto": "tcp",
+						"dest_port": "22",
+						"target": "accept"
+					},
+					{
+						"type": "rule",
+						"src": "wan",
+						"dest": "lan",
+						"proto": "udp",
+						"dest_port": "53",
+						"target": "accept",
+						"device": ""
+					},
+					{
+						"type": "rule",
+						"proto": "tcp",
+						"dest_port": "8080",
+						"target": "accept",
+						"device": ""
+					},
+					{
+						"type": "nat",
+						"target": "SNAT",
+						"dest": "lan",
+						"snat_ip": "10.11.12.194",
+						"device": ""
+					}
+				]
+			}
+		}
+	]
+}
+-- End --
+
+-- File uci/firewall.json --
+{
+	"defaults": [
+		{
+			"input": "ACCEPT",
+			"output": "ACCEPT",
+			"forward": "REJECT"
+		}
+	],
+	"zone": [
+		{
+			"name": "lan",
+			"input": "ACCEPT",
+			"output": "ACCEPT",
+			"forward": "ACCEPT",
+			"network": "lan"
+		},
+		{
+			"name": "wan",
+			"input": "REJECT",
+			"output": "ACCEPT",
+			"forward": "REJECT",
+			"masq": "1",
+			"network": "wan"
+		}
+	]
+}
+-- End --
+
+-- Expect stderr --
+[!] ubus rule (ubus:tun[none] rule 2) must reference a zone when opting out of device binding, ignoring section
+[!] ubus nat (ubus:tun[none] nat 3) must reference a zone when opting out of device binding, ignoring section
+-- End --
+
+-- Expect stdout --
+table inet fw4
+flush table inet fw4
+
+table inet fw4 {
+	#
+	# Defines
+	#
+
+	define lan_devices = { "br-lan" }
+	define lan_subnets = { 192.168.1.0/24 }
+
+	define wan_devices = { "pppoe-wan", "tun0" }
+	define wan_subnets = { 10.11.12.0/24 }
+
+
+	#
+	# User includes
+	#
+
+	include "/etc/nftables.d/*.nft"
+
+
+	#
+	# Filter rules
+	#
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+
+		iif "lo" accept comment "!fw4: Accept traffic from loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle inbound flows"
+		iifname "br-lan" jump input_lan comment "!fw4: Handle lan IPv4/IPv6 input traffic"
+		iifname { "pppoe-wan", "tun0" } jump input_wan comment "!fw4: Handle wan IPv4/IPv6 input traffic"
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle forwarded flows"
+		iifname "br-lan" jump forward_lan comment "!fw4: Handle lan IPv4/IPv6 forward traffic"
+		iifname { "pppoe-wan", "tun0" } jump forward_wan comment "!fw4: Handle wan IPv4/IPv6 forward traffic"
+		jump handle_reject
+	}
+
+	chain output {
+		type filter hook output priority filter; policy accept;
+
+		oif "lo" accept comment "!fw4: Accept traffic towards loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle outbound flows"
+		oifname "br-lan" jump output_lan comment "!fw4: Handle lan IPv4/IPv6 output traffic"
+		oifname { "pppoe-wan", "tun0" } jump output_wan comment "!fw4: Handle wan IPv4/IPv6 output traffic"
+	}
+
+	chain prerouting {
+		type filter hook prerouting priority filter; policy accept;
+		iifname "br-lan" jump helper_lan comment "!fw4: Handle lan IPv4/IPv6 helper assignment"
+	}
+
+	chain handle_reject {
+		meta l4proto tcp reject with tcp reset comment "!fw4: Reject TCP traffic"
+		reject with icmpx type port-unreachable comment "!fw4: Reject any other traffic"
+	}
+
+	chain input_lan {
+		jump accept_from_lan
+	}
+
+	chain output_lan {
+		jump accept_to_lan
+	}
+
+	chain forward_lan {
+		jump accept_to_lan
+	}
+
+	chain helper_lan {
+	}
+
+	chain accept_from_lan {
+		iifname "br-lan" counter accept comment "!fw4: accept lan IPv4/IPv6 traffic"
+	}
+
+	chain accept_to_lan {
+		oifname "br-lan" counter accept comment "!fw4: accept lan IPv4/IPv6 traffic"
+	}
+
+	chain input_wan {
+		jump reject_from_wan
+	}
+
+	chain output_wan {
+		jump accept_to_wan
+	}
+
+	chain forward_wan {
+		iifname "tun0" tcp dport 22 counter jump accept_to_lan comment "!fw4: ubus:tun[none] rule 0"
+		udp dport 53 counter jump accept_to_lan comment "!fw4: ubus:tun[none] rule 1"
+		jump reject_to_wan
+	}
+
+	chain accept_to_wan {
+		meta nfproto ipv4 oifname { "pppoe-wan", "tun0" } ct state invalid counter drop comment "!fw4: Prevent NAT leakage"
+		oifname { "pppoe-wan", "tun0" } counter accept comment "!fw4: accept wan IPv4/IPv6 traffic"
+	}
+
+	chain reject_from_wan {
+		iifname { "pppoe-wan", "tun0" } counter jump handle_reject comment "!fw4: reject wan IPv4/IPv6 traffic"
+	}
+
+	chain reject_to_wan {
+		oifname { "pppoe-wan", "tun0" } counter jump handle_reject comment "!fw4: reject wan IPv4/IPv6 traffic"
+	}
+
+
+	#
+	# NAT rules
+	#
+
+	chain dstnat {
+		type nat hook prerouting priority dstnat; policy accept;
+	}
+
+	chain srcnat {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname { "pppoe-wan", "tun0" } jump srcnat_wan comment "!fw4: Handle wan IPv4/IPv6 srcnat traffic"
+	}
+
+	chain srcnat_wan {
+		meta nfproto ipv4 masquerade comment "!fw4: Masquerade IPv4 wan traffic"
+	}
+
+
+	#
+	# Raw rules (notrack)
+	#
+
+	chain raw_prerouting {
+		type filter hook prerouting priority raw; policy accept;
+	}
+
+	chain raw_output {
+		type filter hook output priority raw; policy accept;
+	}
+
+
+	#
+	# Mangle rules
+	#
+
+	chain mangle_prerouting {
+		type filter hook prerouting priority mangle; policy accept;
+	}
+
+	chain mangle_postrouting {
+		type filter hook postrouting priority mangle; policy accept;
+	}
+
+	chain mangle_input {
+		type filter hook input priority mangle; policy accept;
+	}
+
+	chain mangle_output {
+		type route hook output priority mangle; policy accept;
+	}
+
+	chain mangle_forward {
+		type filter hook forward priority mangle; policy accept;
+	}
+}
+-- End --

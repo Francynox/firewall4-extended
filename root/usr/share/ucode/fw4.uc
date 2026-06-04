@@ -659,15 +659,32 @@ return {
 				}
 
 				if (type(ifc.data?.firewall) == "array") {
+					let source = `ubus:${ifc.interface}[${ifc.proto}]`;
 					let n = 0;
 
 					for (let rulespec in ifc.data.firewall) {
-						push(rules, {
-							...rulespec,
+						let device_scoped = (rulespec.type == 'rule' || rulespec.type == 'nat');
+						let rule = { ...rulespec };
 
-							name: (rulespec.type != 'ipset') ? `ubus:${ifc.interface}[${ifc.proto}] ${rulespec.type || 'rule'} ${n}` : rulespec.name,
-							device: rulespec.device ?? ifc.l3_device ?? ifc.device
-						});
+						if (rulespec.type != 'ipset' && rulespec.type != 'zone')
+							rule.name = `${source} ${rulespec.type || 'rule'} ${n}`;
+
+						// an empty device opts a rule or nat out of the interface pin
+						if (device_scoped) {
+							if (rule.device == "") {
+								if (!rule.src && !(rulespec.type == 'rule' && rule.dest)) {
+									this.warn_section(rule, "must reference a zone when opting out of device binding, ignoring section");
+									n++;
+									continue;
+								}
+
+								delete rule.device;
+							}
+							else if (rule.device == null)
+								rule.device = ifc.l3_device ?? ifc.device;
+						}
+
+						push(rules, rule);
 
 						n++;
 					}
