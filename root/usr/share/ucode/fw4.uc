@@ -684,6 +684,9 @@ return {
 								rule.device = ifc.l3_device ?? ifc.device;
 						}
 
+						if (rulespec.type == 'zone')
+							rule[".source"] = source;
+
 						push(rules, rule);
 
 						n++;
@@ -702,14 +705,18 @@ return {
 		if (type(services) == "object") {
 			for (let svcname, service in services) {
 				if (type(service?.firewall) == "array") {
+					let source = `ubus:${svcname}`;
 					let n = 0;
 
 					for (let rulespec in services[svcname].firewall) {
-						push(rules, {
-							...rulespec,
+						let rule = { ...rulespec };
 
-							name: (rulespec.type != 'ipset') ? `ubus:${svcname} ${rulespec.type || 'rule'} ${n}` : rulespec.name
-						});
+						if (rulespec.type == 'zone')
+							rule[".source"] = source;
+						else if (rulespec.type != 'ipset')
+							rule.name = `${source} ${rulespec.type || 'rule'} ${n}`;
+
+						push(rules, rule);
 
 						n++;
 					}
@@ -717,14 +724,18 @@ return {
 
 				for (let svcinst, instance in service) {
 					if (type(instance?.firewall) == "array") {
+						let source = `ubus:${svcname}[${svcinst}]`;
 						let n = 0;
 
 						for (let rulespec in instance.firewall) {
-							push(rules, {
-								...rulespec,
+							let rule = { ...rulespec };
 
-								name: (rulespec.type != 'ipset') ? `ubus:${svcname}[${svcinst}] ${rulespec.type || 'rule'} ${n}` : rulespec.name
-							});
+							if (rulespec.type == 'zone')
+								rule[".source"] = source;
+							else if (rulespec.type != 'ipset')
+								rule.name = `${source} ${rulespec.type || 'rule'} ${n}`;
+
+							push(rules, rule);
 
 							n++;
 						}
@@ -796,8 +807,10 @@ return {
 		// Build list of logical zones
 		//
 
-		if (!this.state.zones)
+		if (!this.state.zones) {
+			map(filter(this.state.ubus_rules, z => (z.type == "zone")), z => self.parse_zone(z));
 			this.cursor.foreach("firewall", "zone", z => self.parse_zone(z));
+		}
 
 
 		//
@@ -1057,10 +1070,12 @@ return {
 				this.warn("Section %s %s", this.section_id(s[".name"]), msg);
 		}
 		else {
+			let src = s[".source"] ?? "ubus";
+
 			if (s.name)
-				this.warn("ubus %s (%s) %s", s.type || "rule", s.name, msg);
+				this.warn("%s %s (%s) %s", src, s.type || "rule", s.name, msg);
 			else
-				this.warn("ubus %s %s", s.type || "rule", msg);
+				this.warn("%s %s %s", src, s.type || "rule", msg);
 		}
 	},
 
@@ -2012,6 +2027,10 @@ return {
 	},
 
 	parse_zone: function(data) {
+		let policy_def = (!data[".name"] && data.type == "zone")
+			? "drop"
+			: (this.state.defaults ? null : "drop");
+
 		let zone = this.parse_options(data, {
 			enabled: [ "bool", "1" ],
 
@@ -2022,9 +2041,9 @@ return {
 			device: [ "device", null, PARSE_LIST ],
 			subnet: [ "network", null, PARSE_LIST ],
 
-			input: [ "policy", this.state.defaults ? this.state.defaults.input : "drop" ],
-			output: [ "policy", this.state.defaults ? this.state.defaults.output : "drop" ],
-			forward: [ "policy", this.state.defaults ? this.state.defaults.forward : "drop" ],
+			input: [ "policy", policy_def ?? this.state.defaults.input ],
+			output: [ "policy", policy_def ?? this.state.defaults.output ],
+			forward: [ "policy", policy_def ?? this.state.defaults.forward ],
 
 			masq: [ "bool" ],
 			masq_allow_invalid: [ "bool" ],

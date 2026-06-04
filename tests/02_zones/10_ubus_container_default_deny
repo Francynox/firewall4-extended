@@ -1,7 +1,7 @@
-Testing that zones sharing a name no longer render duplicate nftables
-defines and chains, which nft rejects wholesale. The first zone of a given
-name wins and later ones are skipped with a diagnostic; a zone declared via
-ubus never displaces a uci zone of the same name.
+Testing that a per-container fw4 zone declared over ubus with no explicit
+policies and no egress/ingress flows defaults to deny-all: input, output and
+forward towards the zone devices all DROP, even though the global defaults
+are permissive (ACCEPT/ACCEPT/REJECT).
 
 -- Testcase --
 {%
@@ -28,6 +28,14 @@ ubus never displaces a uci zone of the same name.
 0x1103
 -- End --
 
+-- File fs/open~_sys_class_net_vh-c2_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_vc-c2_flags.txt --
+0x1103
+-- End --
+
 -- File ubus/network.interface~dump.json --
 {
 	"interface": [
@@ -48,40 +56,35 @@ ubus never displaces a uci zone of the same name.
 			"device": "eth1",
 			"ipv4-address": [ { "address": "10.11.12.194", "mask": 24 } ],
 			"data": {}
+		},
+		{
+			"interface": "c2_gw",
+			"up": true,
+			"l3_device": "vh-c2",
+			"proto": "static",
+			"device": "vh-c2",
+			"ipv4-address": [ { "address": "10.7.8.1", "mask": 31 } ],
+			"data": {
+				"zone": "cont_c2",
+				"firewall": [
+					{
+						"type": "zone",
+						"name": "cont_c2"
+					}
+				]
+			}
+		},
+		{
+			"interface": "c2",
+			"up": true,
+			"l3_device": "vc-c2",
+			"proto": "none",
+			"device": "vc-c2",
+			"data": {
+				"zone": "cont_c2"
+			}
 		}
 	]
-}
--- End --
-
--- File ubus/service~get_data~type-firewall.json --
-{
-	"svc1": {
-		"firewall": [
-			{
-				"type": "zone",
-				"name": "czdup",
-				"subnet": [ "10.99.0.0/24" ]
-			}
-		]
-	},
-	"svc2": {
-		"firewall": [
-			{
-				"type": "zone",
-				"name": "czdup",
-				"subnet": [ "10.98.0.0/24" ]
-			}
-		]
-	},
-	"svc3": {
-		"firewall": [
-			{
-				"type": "zone",
-				"name": "wan",
-				"input": "ACCEPT"
-			}
-		]
-	}
 }
 -- End --
 
@@ -109,21 +112,12 @@ ubus never displaces a uci zone of the same name.
 			"forward": "REJECT",
 			"masq": "1",
 			"network": "wan"
-		},
-		{
-			"name": "lan",
-			"input": "REJECT",
-			"output": "REJECT",
-			"forward": "REJECT"
 		}
 	]
 }
 -- End --
 
 -- Expect stderr --
-[!] ubus:svc2 zone (czdup) has a duplicate name, ignoring section
-[!] ubus:svc3 zone (wan) duplicates a uci zone, ignoring section
-[!] Section @zone[2] (lan) has a duplicate name, ignoring section
 -- End --
 
 -- Expect stdout --
@@ -135,8 +129,8 @@ table inet fw4 {
 	# Defines
 	#
 
-	define czdup_devices = {  }
-	define czdup_subnets = { 10.99.0.0/24 }
+	define cont_c2_devices = { "vh-c2", "vc-c2" }
+	define cont_c2_subnets = { 10.7.8.0/31 }
 
 	define lan_devices = { "br-lan" }
 	define lan_subnets = { 192.168.1.0/24 }
@@ -162,7 +156,7 @@ table inet fw4 {
 		iif "lo" accept comment "!fw4: Accept traffic from loopback"
 
 		ct state vmap { established : accept, related : accept } comment "!fw4: Handle inbound flows"
-		meta nfproto ipv4 ip saddr 10.99.0.0/24 jump input_czdup comment "!fw4: Handle czdup IPv4 input traffic"
+		iifname { "vh-c2", "vc-c2" } jump input_cont_c2 comment "!fw4: Handle cont_c2 IPv4/IPv6 input traffic"
 		iifname "br-lan" jump input_lan comment "!fw4: Handle lan IPv4/IPv6 input traffic"
 		iifname "pppoe-wan" jump input_wan comment "!fw4: Handle wan IPv4/IPv6 input traffic"
 	}
@@ -171,7 +165,7 @@ table inet fw4 {
 		type filter hook forward priority filter; policy drop;
 
 		ct state vmap { established : accept, related : accept } comment "!fw4: Handle forwarded flows"
-		meta nfproto ipv4 ip saddr 10.99.0.0/24 jump forward_czdup comment "!fw4: Handle czdup IPv4 forward traffic"
+		iifname { "vh-c2", "vc-c2" } jump forward_cont_c2 comment "!fw4: Handle cont_c2 IPv4/IPv6 forward traffic"
 		iifname "br-lan" jump forward_lan comment "!fw4: Handle lan IPv4/IPv6 forward traffic"
 		iifname "pppoe-wan" jump forward_wan comment "!fw4: Handle wan IPv4/IPv6 forward traffic"
 		jump handle_reject
@@ -183,14 +177,14 @@ table inet fw4 {
 		oif "lo" accept comment "!fw4: Accept traffic towards loopback"
 
 		ct state vmap { established : accept, related : accept } comment "!fw4: Handle outbound flows"
-		meta nfproto ipv4 ip daddr 10.99.0.0/24 jump output_czdup comment "!fw4: Handle czdup IPv4 output traffic"
+		oifname { "vh-c2", "vc-c2" } jump output_cont_c2 comment "!fw4: Handle cont_c2 IPv4/IPv6 output traffic"
 		oifname "br-lan" jump output_lan comment "!fw4: Handle lan IPv4/IPv6 output traffic"
 		oifname "pppoe-wan" jump output_wan comment "!fw4: Handle wan IPv4/IPv6 output traffic"
 	}
 
 	chain prerouting {
 		type filter hook prerouting priority filter; policy accept;
-		meta nfproto ipv4 ip saddr 10.99.0.0/24 jump helper_czdup comment "!fw4: Handle czdup IPv4 helper assignment"
+		iifname { "vh-c2", "vc-c2" } jump helper_cont_c2 comment "!fw4: Handle cont_c2 IPv4/IPv6 helper assignment"
 		iifname "br-lan" jump helper_lan comment "!fw4: Handle lan IPv4/IPv6 helper assignment"
 	}
 
@@ -199,27 +193,27 @@ table inet fw4 {
 		reject with icmpx type port-unreachable comment "!fw4: Reject any other traffic"
 	}
 
-	chain input_czdup {
-		jump drop_from_czdup
+	chain input_cont_c2 {
+		jump drop_from_cont_c2
 	}
 
-	chain output_czdup {
-		jump drop_to_czdup
+	chain output_cont_c2 {
+		jump drop_to_cont_c2
 	}
 
-	chain forward_czdup {
-		jump drop_to_czdup
+	chain forward_cont_c2 {
+		jump drop_to_cont_c2
 	}
 
-	chain helper_czdup {
+	chain helper_cont_c2 {
 	}
 
-	chain drop_from_czdup {
-		meta nfproto ipv4 ip saddr 10.99.0.0/24 counter drop comment "!fw4: drop czdup IPv4 traffic"
+	chain drop_from_cont_c2 {
+		iifname { "vh-c2", "vc-c2" } counter drop comment "!fw4: drop cont_c2 IPv4/IPv6 traffic"
 	}
 
-	chain drop_to_czdup {
-		meta nfproto ipv4 ip daddr 10.99.0.0/24 counter drop comment "!fw4: drop czdup IPv4 traffic"
+	chain drop_to_cont_c2 {
+		oifname { "vh-c2", "vc-c2" } counter drop comment "!fw4: drop cont_c2 IPv4/IPv6 traffic"
 	}
 
 	chain input_lan {

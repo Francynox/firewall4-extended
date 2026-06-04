@@ -1,7 +1,8 @@
-Testing that zones sharing a name no longer render duplicate nftables
-defines and chains, which nft rejects wholesale. The first zone of a given
-name wins and later ones are skipped with a diagnostic; a zone declared via
-ubus never displaces a uci zone of the same name.
+Testing that fw4 zones and rules declared ephemerally through procd service
+data (service get_data type firewall) are synthesized with their declared
+names and resolve against uci zones, that an entry without a type field
+remains inert, and that a malformed zone is skipped with a diagnostic while
+the rest of the ruleset stays intact.
 
 -- Testcase --
 {%
@@ -28,6 +29,10 @@ ubus never displaces a uci zone of the same name.
 0x1103
 -- End --
 
+-- File fs/open~_sys_class_net_vh-ha_flags.txt --
+0x1103
+-- End --
+
 -- File ubus/network.interface~dump.json --
 {
 	"interface": [
@@ -48,6 +53,15 @@ ubus never displaces a uci zone of the same name.
 			"device": "eth1",
 			"ipv4-address": [ { "address": "10.11.12.194", "mask": 24 } ],
 			"data": {}
+		},
+		{
+			"interface": "cn_ha",
+			"up": true,
+			"l3_device": "vh-ha",
+			"proto": "static",
+			"device": "vh-ha",
+			"ipv4-address": [ { "address": "10.183.224.1", "mask": 28 } ],
+			"data": {}
 		}
 	]
 }
@@ -55,30 +69,40 @@ ubus never displaces a uci zone of the same name.
 
 -- File ubus/service~get_data~type-firewall.json --
 {
-	"svc1": {
-		"firewall": [
-			{
-				"type": "zone",
-				"name": "czdup",
-				"subnet": [ "10.99.0.0/24" ]
-			}
-		]
+	"container": {
+		"cn_ha": {
+			"firewall": [
+				{
+					"type": "zone",
+					"name": "cz_ha",
+					"input": "REJECT",
+					"output": "ACCEPT",
+					"forward": "REJECT",
+					"masq": "1",
+					"mtu_fix": "1",
+					"network": [ "cn_ha" ]
+				},
+				{
+					"type": "rule",
+					"target": "ACCEPT",
+					"src": "cz_ha",
+					"dest_port": "53",
+					"proto": "udp"
+				},
+				{
+					"target": "ACCEPT",
+					"src": "cz_ha",
+					"dest_port": "123",
+					"proto": "udp"
+				}
+			]
+		}
 	},
-	"svc2": {
+	"badsvc": {
 		"firewall": [
 			{
 				"type": "zone",
-				"name": "czdup",
-				"subnet": [ "10.98.0.0/24" ]
-			}
-		]
-	},
-	"svc3": {
-		"firewall": [
-			{
-				"type": "zone",
-				"name": "wan",
-				"input": "ACCEPT"
+				"name": "bad zone"
 			}
 		]
 	}
@@ -109,21 +133,20 @@ ubus never displaces a uci zone of the same name.
 			"forward": "REJECT",
 			"masq": "1",
 			"network": "wan"
-		},
+		}
+	],
+	"forwarding": [
 		{
-			"name": "lan",
-			"input": "REJECT",
-			"output": "REJECT",
-			"forward": "REJECT"
+			"src": "lan",
+			"dest": "cz_ha"
 		}
 	]
 }
 -- End --
 
 -- Expect stderr --
-[!] ubus:svc2 zone (czdup) has a duplicate name, ignoring section
-[!] ubus:svc3 zone (wan) duplicates a uci zone, ignoring section
-[!] Section @zone[2] (lan) has a duplicate name, ignoring section
+[!] ubus:badsvc zone (bad zone) option 'name' specifies invalid value 'bad zone'
+[!] ubus:badsvc zone (bad zone) skipped due to invalid options
 -- End --
 
 -- Expect stdout --
@@ -135,8 +158,8 @@ table inet fw4 {
 	# Defines
 	#
 
-	define czdup_devices = {  }
-	define czdup_subnets = { 10.99.0.0/24 }
+	define cz_ha_devices = { "vh-ha" }
+	define cz_ha_subnets = { 10.183.224.0/28 }
 
 	define lan_devices = { "br-lan" }
 	define lan_subnets = { 192.168.1.0/24 }
@@ -162,7 +185,7 @@ table inet fw4 {
 		iif "lo" accept comment "!fw4: Accept traffic from loopback"
 
 		ct state vmap { established : accept, related : accept } comment "!fw4: Handle inbound flows"
-		meta nfproto ipv4 ip saddr 10.99.0.0/24 jump input_czdup comment "!fw4: Handle czdup IPv4 input traffic"
+		iifname "vh-ha" jump input_cz_ha comment "!fw4: Handle cz_ha IPv4/IPv6 input traffic"
 		iifname "br-lan" jump input_lan comment "!fw4: Handle lan IPv4/IPv6 input traffic"
 		iifname "pppoe-wan" jump input_wan comment "!fw4: Handle wan IPv4/IPv6 input traffic"
 	}
@@ -171,7 +194,7 @@ table inet fw4 {
 		type filter hook forward priority filter; policy drop;
 
 		ct state vmap { established : accept, related : accept } comment "!fw4: Handle forwarded flows"
-		meta nfproto ipv4 ip saddr 10.99.0.0/24 jump forward_czdup comment "!fw4: Handle czdup IPv4 forward traffic"
+		iifname "vh-ha" jump forward_cz_ha comment "!fw4: Handle cz_ha IPv4/IPv6 forward traffic"
 		iifname "br-lan" jump forward_lan comment "!fw4: Handle lan IPv4/IPv6 forward traffic"
 		iifname "pppoe-wan" jump forward_wan comment "!fw4: Handle wan IPv4/IPv6 forward traffic"
 		jump handle_reject
@@ -183,14 +206,13 @@ table inet fw4 {
 		oif "lo" accept comment "!fw4: Accept traffic towards loopback"
 
 		ct state vmap { established : accept, related : accept } comment "!fw4: Handle outbound flows"
-		meta nfproto ipv4 ip daddr 10.99.0.0/24 jump output_czdup comment "!fw4: Handle czdup IPv4 output traffic"
+		oifname "vh-ha" jump output_cz_ha comment "!fw4: Handle cz_ha IPv4/IPv6 output traffic"
 		oifname "br-lan" jump output_lan comment "!fw4: Handle lan IPv4/IPv6 output traffic"
 		oifname "pppoe-wan" jump output_wan comment "!fw4: Handle wan IPv4/IPv6 output traffic"
 	}
 
 	chain prerouting {
 		type filter hook prerouting priority filter; policy accept;
-		meta nfproto ipv4 ip saddr 10.99.0.0/24 jump helper_czdup comment "!fw4: Handle czdup IPv4 helper assignment"
 		iifname "br-lan" jump helper_lan comment "!fw4: Handle lan IPv4/IPv6 helper assignment"
 	}
 
@@ -199,27 +221,30 @@ table inet fw4 {
 		reject with icmpx type port-unreachable comment "!fw4: Reject any other traffic"
 	}
 
-	chain input_czdup {
-		jump drop_from_czdup
+	chain input_cz_ha {
+		udp dport 53 counter accept comment "!fw4: ubus:container[cn_ha] rule 1"
+		jump reject_from_cz_ha
 	}
 
-	chain output_czdup {
-		jump drop_to_czdup
+	chain output_cz_ha {
+		jump accept_to_cz_ha
 	}
 
-	chain forward_czdup {
-		jump drop_to_czdup
+	chain forward_cz_ha {
+		jump reject_to_cz_ha
 	}
 
-	chain helper_czdup {
+	chain accept_to_cz_ha {
+		meta nfproto ipv4 oifname "vh-ha" ct state invalid counter drop comment "!fw4: Prevent NAT leakage"
+		oifname "vh-ha" counter accept comment "!fw4: accept cz_ha IPv4/IPv6 traffic"
 	}
 
-	chain drop_from_czdup {
-		meta nfproto ipv4 ip saddr 10.99.0.0/24 counter drop comment "!fw4: drop czdup IPv4 traffic"
+	chain reject_from_cz_ha {
+		iifname "vh-ha" counter jump handle_reject comment "!fw4: reject cz_ha IPv4/IPv6 traffic"
 	}
 
-	chain drop_to_czdup {
-		meta nfproto ipv4 ip daddr 10.99.0.0/24 counter drop comment "!fw4: drop czdup IPv4 traffic"
+	chain reject_to_cz_ha {
+		oifname "vh-ha" counter jump handle_reject comment "!fw4: reject cz_ha IPv4/IPv6 traffic"
 	}
 
 	chain input_lan {
@@ -231,6 +256,7 @@ table inet fw4 {
 	}
 
 	chain forward_lan {
+		jump accept_to_cz_ha comment "!fw4: Accept lan to cz_ha forwarding"
 		jump accept_to_lan
 	}
 
@@ -281,7 +307,12 @@ table inet fw4 {
 
 	chain srcnat {
 		type nat hook postrouting priority srcnat; policy accept;
+		oifname "vh-ha" jump srcnat_cz_ha comment "!fw4: Handle cz_ha IPv4/IPv6 srcnat traffic"
 		oifname "pppoe-wan" jump srcnat_wan comment "!fw4: Handle wan IPv4/IPv6 srcnat traffic"
+	}
+
+	chain srcnat_cz_ha {
+		meta nfproto ipv4 masquerade comment "!fw4: Masquerade IPv4 cz_ha traffic"
 	}
 
 	chain srcnat_wan {
@@ -312,6 +343,7 @@ table inet fw4 {
 
 	chain mangle_postrouting {
 		type filter hook postrouting priority mangle; policy accept;
+		oifname "vh-ha" tcp flags syn / syn,fin,rst tcp option maxseg size set rt mtu comment "!fw4: Zone cz_ha IPv4/IPv6 egress MTU fixing"
 	}
 
 	chain mangle_input {
@@ -324,6 +356,7 @@ table inet fw4 {
 
 	chain mangle_forward {
 		type filter hook forward priority mangle; policy accept;
+		iifname "vh-ha" tcp flags syn / syn,fin,rst tcp option maxseg size set rt mtu comment "!fw4: Zone cz_ha IPv4/IPv6 ingress MTU fixing"
 	}
 }
 -- End --
