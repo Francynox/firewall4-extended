@@ -1,0 +1,337 @@
+Testing that a source NAT rewrite range is accepted for proto icmp, where it
+maps the ICMP identifier rather than a port. MAP-E portsets rely on this to
+keep translated identifiers within the assigned port set (RFC 7597), with
+one nat spec per proto in icmp/tcp/udp published by map.sh through the
+per-interface ubus data.firewall array, and firewall3 accepted the same.
+An ipv6-icmp rewrite implies the IPv6 family, and port match options still
+require a UDP or TCP protocol.
+
+-- Testcase --
+{%
+	include("./root/usr/share/firewall4/main.uc", {
+		getenv: function(varname) {
+			switch (varname) {
+			case 'ACTION':
+				return 'print';
+			}
+		}
+	})
+%}
+-- End --
+
+-- File uci/helpers.json --
+{}
+-- End --
+
+-- File fs/open~_sys_class_net_br-lan_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_eth1_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_map-wan_4_flags.txt --
+0x1103
+-- End --
+
+-- File ubus/network.interface~dump.json --
+{
+	"interface": [
+		{
+			"interface": "lan",
+			"up": true,
+			"l3_device": "br-lan",
+			"proto": "static",
+			"device": "br-lan",
+			"ipv4-address": [ { "address": "192.168.1.1", "mask": 24 } ],
+			"data": {}
+		},
+		{
+			"interface": "wan",
+			"up": true,
+			"l3_device": "eth1",
+			"proto": "dhcp",
+			"device": "eth1",
+			"ipv4-address": [ { "address": "10.11.12.194", "mask": 24 } ],
+			"data": {}
+		},
+		{
+			"interface": "wan_4",
+			"up": true,
+			"l3_device": "map-wan_4",
+			"proto": "map",
+			"device": "map-wan_4",
+			"data": {
+				"zone": "wan",
+				"firewall": [
+					{
+						"type": "nat",
+						"target": "SNAT",
+						"family": "inet",
+						"proto": "icmp",
+						"connlimit_ports": true,
+						"snat_ip": "192.0.2.66",
+						"snat_port": "2048-2079"
+					},
+					{
+						"type": "nat",
+						"target": "SNAT",
+						"family": "inet",
+						"proto": "tcp",
+						"connlimit_ports": true,
+						"snat_ip": "192.0.2.66",
+						"snat_port": "2048-2079"
+					},
+					{
+						"type": "nat",
+						"target": "SNAT",
+						"family": "inet",
+						"proto": "udp",
+						"connlimit_ports": true,
+						"snat_ip": "192.0.2.66",
+						"snat_port": "2048-2079"
+					}
+				]
+			}
+		}
+	]
+}
+-- End --
+
+-- File uci/firewall.json --
+{
+	"defaults": [
+		{
+			"input": "ACCEPT",
+			"output": "ACCEPT",
+			"forward": "REJECT"
+		}
+	],
+	"zone": [
+		{
+			"name": "lan",
+			"input": "ACCEPT",
+			"output": "ACCEPT",
+			"forward": "ACCEPT",
+			"network": "lan"
+		},
+		{
+			"name": "wan",
+			"input": "REJECT",
+			"output": "ACCEPT",
+			"forward": "REJECT",
+			"network": "wan"
+		}
+	],
+	"nat": [
+		{
+			"name": "ICMP id range",
+			"src": "wan",
+			"proto": "icmp",
+			"target": "SNAT",
+			"snat_ip": "192.0.2.67",
+			"snat_port": "4096-4127"
+		},
+		{
+			"name": "ICMPv6 id range",
+			"src": "wan",
+			"proto": "icmpv6",
+			"target": "SNAT",
+			"snat_ip": "2001:db8::1",
+			"snat_port": "4096-4127"
+		},
+		{
+			"name": "ICMP port match",
+			"src": "wan",
+			"proto": "icmp",
+			"target": "SNAT",
+			"snat_ip": "192.0.2.68",
+			"src_port": "1024-2047"
+		}
+	]
+}
+-- End --
+
+-- Expect stderr --
+[!] Section @nat[2] (ICMP port match) specifies ports but no UDP/TCP protocol, ignoring section
+-- End --
+
+-- Expect stdout --
+table inet fw4
+flush table inet fw4
+
+table inet fw4 {
+	#
+	# Defines
+	#
+
+	define lan_devices = { "br-lan" }
+	define lan_subnets = { 192.168.1.0/24 }
+
+	define wan_devices = { "eth1", "map-wan_4" }
+	define wan_subnets = { 10.11.12.0/24 }
+
+
+	#
+	# User includes
+	#
+
+	include "/etc/nftables.d/*.nft"
+
+
+	#
+	# Filter rules
+	#
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+
+		iif "lo" accept comment "!fw4: Accept traffic from loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle inbound flows"
+		iifname "br-lan" jump input_lan comment "!fw4: Handle lan IPv4/IPv6 input traffic"
+		iifname { "eth1", "map-wan_4" } jump input_wan comment "!fw4: Handle wan IPv4/IPv6 input traffic"
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle forwarded flows"
+		iifname "br-lan" jump forward_lan comment "!fw4: Handle lan IPv4/IPv6 forward traffic"
+		iifname { "eth1", "map-wan_4" } jump forward_wan comment "!fw4: Handle wan IPv4/IPv6 forward traffic"
+		jump handle_reject
+	}
+
+	chain output {
+		type filter hook output priority filter; policy accept;
+
+		oif "lo" accept comment "!fw4: Accept traffic towards loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle outbound flows"
+		oifname "br-lan" jump output_lan comment "!fw4: Handle lan IPv4/IPv6 output traffic"
+		oifname { "eth1", "map-wan_4" } jump output_wan comment "!fw4: Handle wan IPv4/IPv6 output traffic"
+	}
+
+	chain prerouting {
+		type filter hook prerouting priority filter; policy accept;
+		iifname "br-lan" jump helper_lan comment "!fw4: Handle lan IPv4/IPv6 helper assignment"
+		iifname { "eth1", "map-wan_4" } jump helper_wan comment "!fw4: Handle wan IPv4/IPv6 helper assignment"
+	}
+
+	chain handle_reject {
+		meta l4proto tcp reject with tcp reset comment "!fw4: Reject TCP traffic"
+		reject with icmpx type port-unreachable comment "!fw4: Reject any other traffic"
+	}
+
+	chain input_lan {
+		jump accept_from_lan
+	}
+
+	chain output_lan {
+		jump accept_to_lan
+	}
+
+	chain forward_lan {
+		jump accept_to_lan
+	}
+
+	chain helper_lan {
+	}
+
+	chain accept_from_lan {
+		iifname "br-lan" counter accept comment "!fw4: accept lan IPv4/IPv6 traffic"
+	}
+
+	chain accept_to_lan {
+		oifname "br-lan" counter accept comment "!fw4: accept lan IPv4/IPv6 traffic"
+	}
+
+	chain input_wan {
+		jump reject_from_wan
+	}
+
+	chain output_wan {
+		jump accept_to_wan
+	}
+
+	chain forward_wan {
+		jump reject_to_wan
+	}
+
+	chain helper_wan {
+	}
+
+	chain accept_to_wan {
+		oifname { "eth1", "map-wan_4" } counter accept comment "!fw4: accept wan IPv4/IPv6 traffic"
+	}
+
+	chain reject_from_wan {
+		iifname { "eth1", "map-wan_4" } counter jump handle_reject comment "!fw4: reject wan IPv4/IPv6 traffic"
+	}
+
+	chain reject_to_wan {
+		oifname { "eth1", "map-wan_4" } counter jump handle_reject comment "!fw4: reject wan IPv4/IPv6 traffic"
+	}
+
+
+	#
+	# NAT rules
+	#
+
+	chain dstnat {
+		type nat hook prerouting priority dstnat; policy accept;
+	}
+
+	chain srcnat {
+		type nat hook postrouting priority srcnat; policy accept;
+		meta nfproto ipv4 meta l4proto icmp oifname "map-wan_4" counter snat 192.0.2.66:2048-2079 comment "!fw4: ubus:wan_4[map] nat 0"
+		meta nfproto ipv4 meta l4proto tcp oifname "map-wan_4" counter snat 192.0.2.66:2048-2079 comment "!fw4: ubus:wan_4[map] nat 1"
+		meta nfproto ipv4 meta l4proto udp oifname "map-wan_4" counter snat 192.0.2.66:2048-2079 comment "!fw4: ubus:wan_4[map] nat 2"
+		oifname { "eth1", "map-wan_4" } jump srcnat_wan comment "!fw4: Handle wan IPv4/IPv6 srcnat traffic"
+	}
+
+	chain srcnat_wan {
+		meta nfproto ipv4 meta l4proto icmp counter snat 192.0.2.67:4096-4127 comment "!fw4: ICMP id range"
+		meta nfproto ipv6 meta l4proto ipv6-icmp counter snat [2001:db8::1]:4096-4127 comment "!fw4: ICMPv6 id range"
+	}
+
+
+	#
+	# Raw rules (notrack)
+	#
+
+	chain raw_prerouting {
+		type filter hook prerouting priority raw; policy accept;
+	}
+
+	chain raw_output {
+		type filter hook output priority raw; policy accept;
+	}
+
+
+	#
+	# Mangle rules
+	#
+
+	chain mangle_prerouting {
+		type filter hook prerouting priority mangle; policy accept;
+	}
+
+	chain mangle_postrouting {
+		type filter hook postrouting priority mangle; policy accept;
+	}
+
+	chain mangle_input {
+		type filter hook input priority mangle; policy accept;
+	}
+
+	chain mangle_output {
+		type route hook output priority mangle; policy accept;
+	}
+
+	chain mangle_forward {
+		type filter hook forward priority mangle; policy accept;
+	}
+}
+-- End --

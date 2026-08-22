@@ -3116,8 +3116,14 @@ return {
 			return;
 		}
 
-		if ((snat.snat_port || snat.src_port || snat.dest_port) && !ensure_tcpudp(snat.proto)) {
+		if ((snat.src_port || snat.dest_port) && !ensure_tcpudp(snat.proto)) {
 			this.warn_section(data, "specifies ports but no UDP/TCP protocol, ignoring section");
+			return;
+		}
+
+		if (snat.snat_port && !ensure_tcpudp(snat.proto) &&
+		    !length(filter(snat.proto, p => (p.name in [ "icmp", "ipv6-icmp" ])))) {
+			this.warn_section(data, "specifies ports but no UDP/TCP/ICMP protocol, ignoring section");
 			return;
 		}
 
@@ -3176,6 +3182,15 @@ return {
 			case "udp":
 				sport = snat.src_port;
 				dport = snat.dest_port;
+				rport = snat.snat_port;
+				break;
+
+			case "icmp":
+				rport = snat.snat_port;
+				break;
+
+			case "ipv6-icmp":
+				family = 6;
 				rport = snat.snat_port;
 				break;
 			}
