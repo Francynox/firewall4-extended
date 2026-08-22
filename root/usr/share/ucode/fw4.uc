@@ -755,6 +755,17 @@ return {
 
 
 		//
+		// Warn about ubus rule specs of unknown type
+		//
+
+		let known_types = [ "ipset", "zone", "rule", "forwarding", "redirect", "nat" ];
+
+		for (let r in this.state.ubus_rules)
+			if (r.type && !(r.type in known_types))
+				this.warn_section(r, `specifies unknown type '${r.type}', ignoring section`);
+
+
+		//
 		// Build list of ipsets
 		//
 
