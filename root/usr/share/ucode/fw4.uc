@@ -2030,6 +2030,22 @@ return {
 			return;
 		}
 
+		if (filter(this.state.zones, z => z.name == zone.name)?.[0]) {
+			this.warn_section(data, "has a duplicate name, ignoring section");
+			return;
+		}
+
+		if (!data[".name"]) {
+			let uci_names = [];
+
+			this.cursor.foreach("firewall", "zone", s => push(uci_names, s.name));
+
+			if (index(uci_names, zone.name) >= 0) {
+				this.warn_section(data, "duplicates a uci zone, ignoring section");
+				return;
+			}
+		}
+
 		for (let helper in zone.helper) {
 			if (!helper.available) {
 				this.warn_section(data, `uses unavailable ct helper '${zone.helper.name}'`);
