@@ -2052,6 +2052,7 @@ return {
 			masq_dest: [ "network", null, PARSE_LIST ],
 
 			masq6: [ "bool" ],
+			reflection: [ "bool" ],
 
 			extra: [ "string", null, UNSUPPORTED ],
 			extra_src: [ "string", null, UNSUPPORTED ],
@@ -2714,7 +2715,7 @@ return {
 
 			mark: [ "mark" ],
 
-			reflection: [ "bool", "1" ],
+			reflection: [ "bool" ],
 			reflection_src: [ "reflection_source", "internal" ],
 
 			reflection_zone: [ "zone_ref", null, PARSE_LIST ],
@@ -2807,12 +2808,6 @@ return {
 			if (!redir.dest_port)
 				redir.dest_port = redir.src_dport;
 
-			if (redir.reflection && redir.dest?.zone && redir.src.zone.masq) {
-				redir.dest.zone.dflags.accept = true;
-				redir.dest.zone.dflags.dnat = true;
-				redir.dest.zone.dflags.snat = true;
-			}
-
 			if (redir.helper)
 				redir.src.zone.dflags.helper = true;
 
@@ -2900,6 +2895,10 @@ return {
 			};
 		};
 
+		let explicit_reflection = (redir.reflection === true || (redir.reflection !== false && length(redir.reflection_zone)));
+		let reflection_allowed = (redir.reflection !== false);
+		let warned_neg_src_dip = false;
+
 		for (let proto in redir.proto) {
 			let sip, dip, rip, iip, eip, refip, sport, dport, rport;
 			let family = redir.family;
@@ -2957,8 +2956,12 @@ return {
 			}
 
 			/* build reflection rules */
-			if (redir.target == "dnat" && redir.reflection &&
-			    (length(rip[0]) || length(rip[1])) && redir.src?.zone && redir.dest?.zone) {
+			let reflect_v4 = (redir.target == "dnat" && reflection_allowed && redir.src?.zone && redir.dest?.zone && length(rip[0]) &&
+				(explicit_reflection || (redir.src.zone.reflection != null ? redir.src.zone.reflection : redir.src.zone.masq)));
+			let reflect_v6 = (redir.target == "dnat" && reflection_allowed && redir.src?.zone && redir.dest?.zone && length(rip[1]) &&
+				(explicit_reflection || (redir.src.zone.reflection != null ? redir.src.zone.reflection : redir.src.zone.masq6)));
+
+			if (reflect_v4 || reflect_v6) {
 				let refredir = {
 					name: `${redir.name} (reflection)`,
 
@@ -2983,6 +2986,16 @@ return {
 				let rzones = length(redir.reflection_zone) ? redir.reflection_zone : [ redir.dest ];
 
 				for (let rzone in rzones) {
+					let is_same_zone = (rzone.zone == redir.src.zone);
+
+					if (redir.src_dip?.invert && (!is_same_zone || redir.reflection_src == "external")) {
+						if (explicit_reflection && !warned_neg_src_dip) {
+							this.warn_section(data, "cannot reflect redirect with negated 'src_dip', disabling reflection");
+							warned_neg_src_dip = true;
+						}
+						continue;
+					}
+
 					if (!is_family(rzone, family)) {
 						this.warn_section(data,
 							`is restricted to IPv${family} but referenced reflection zone is IPv${rzone.family} only, skipping`);
@@ -2993,7 +3006,7 @@ return {
 					let refaddrs = (redir.reflection_src == "internal") ? iaddrs : eaddrs;
 
 					for (let i = 0; i <= 1; i++) {
-						if (redir.src.zone[i ? "masq6" : "masq"] && length(rip[i])) {
+						if (i ? reflect_v6 : reflect_v4) {
 							let snat_addr = refaddrs[i]?.[0];
 
 							/* For internal reflection sources try to find a suitable candiate IP
@@ -3022,21 +3035,25 @@ return {
 							else if (!length(iaddrs[i])) {
 								this.warn_section(data, "internal address range cannot be determined, disabling reflection");
 							}
-							else if (!length(eaddrs[i])) {
+							else if (!is_same_zone && !length(eaddrs[i])) {
 								this.warn_section(data, "external address range cannot be determined, disabling reflection");
 							}
 							else {
-								refredir.src = rzone;
-								refredir.dest = null;
-								refredir.target = "dnat";
+								if (!is_same_zone) {
+									refredir.src = rzone;
+									refredir.dest = null;
+									refredir.target = "dnat";
+									refredir.dnat = false;
 
-								for (let saddrs in subnets_group_by_masking(iaddrs[i]))
-									for (let daddrs in subnets_group_by_masking(eaddrs[i]))
-										add_rule(i ? 6 : 4, proto, saddrs, daddrs, rip[i], sport, dport, rport, null, refredir);
+									for (let saddrs in subnets_group_by_masking(iaddrs[i]))
+										for (let daddrs in subnets_group_by_masking(eaddrs[i]))
+											add_rule(i ? 6 : 4, proto, saddrs, daddrs, rip[i], sport, dport, rport, null, refredir);
+								}
 
 								refredir.src = null;
 								refredir.dest = rzone;
 								refredir.target = "snat";
+								refredir.dnat = is_same_zone;
 
 								for (let daddrs in subnets_group_by_masking(rip[i]))
 									for (let saddrs in subnets_group_by_masking(iaddrs[i]))

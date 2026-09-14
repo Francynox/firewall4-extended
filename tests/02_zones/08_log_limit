@@ -309,10 +309,6 @@ table inet fw4 {
 		limit name "lan.log_limit" log prefix "drop lan forward: "
 	}
 
-	chain accept_to_lan {
-		oifname "br-lan" counter accept comment "!fw4: accept lan IPv4/IPv6 traffic"
-	}
-
 	chain drop_from_lan {
 		iifname "br-lan" limit name "lan.log_limit" log prefix "drop lan in: "
 		iifname "br-lan" counter drop comment "!fw4: drop lan IPv4/IPv6 traffic"

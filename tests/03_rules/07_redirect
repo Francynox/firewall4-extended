@@ -236,10 +236,6 @@ table inet fw4 {
 		jump drop_to_lan
 	}
 
-	chain accept_to_lan {
-		oifname "br-lan" counter accept comment "!fw4: accept lan IPv4/IPv6 traffic"
-	}
-
 	chain drop_from_lan {
 		iifname "br-lan" counter drop comment "!fw4: drop lan IPv4/IPv6 traffic"
 	}

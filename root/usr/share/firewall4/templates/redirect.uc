@@ -1,3 +1,5 @@
+{%+ if (redirect.dnat): -%}
+	ct status dnat {%+ endif -%}
 {%+ if (redirect.family && !redirect.has_addrs): -%}
 	meta nfproto {{ fw4.nfproto(redirect.family) }} {%+ endif -%}
 {%+ if (!redirect.proto.any && !redirect.has_ports): -%}

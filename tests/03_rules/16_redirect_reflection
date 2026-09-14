@@ -1,0 +1,613 @@
+Ensure that NAT reflection is decoupled from zone masquerade via tri-state
+zone and redirect reflection options, preserves upstream defaults when omitted,
+and enforces safety guards against self-reflection and negated src_dip.
+
+-- Testcase --
+{%
+	include("./root/usr/share/firewall4/main.uc", {
+		getenv: function(varname) {
+			switch (varname) {
+			case 'ACTION':
+				return 'print';
+			}
+		}
+	})
+%}
+-- End --
+
+-- File uci/helpers.json --
+{}
+-- End --
+
+-- File fs/open~_sys_class_net_eth2_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_eth3_flags.txt --
+0x1103
+-- End --
+
+-- File ubus/network.interface~dump.json --
+{
+	"interface": [
+		{
+			"interface": "wan",
+			"up": true,
+			"l3_device": "pppoe-wan",
+			"proto": "pppoe",
+			"device": "eth1",
+			"ipv4-address": [ { "address": "10.11.12.194", "mask": 24 } ],
+			"data": {}
+		},
+		{
+			"interface": "wan6",
+			"up": true,
+			"l3_device": "pppoe-wan",
+			"proto": "dhcpv6",
+			"ipv6-address": [ { "address": "2001:db8:54:321::2", "mask": 64 } ],
+			"data": {}
+		},
+		{
+			"interface": "routed",
+			"up": true,
+			"l3_device": "eth2",
+			"proto": "static",
+			"device": "eth2",
+			"ipv4-address": [ { "address": "198.51.100.1", "mask": 24 } ],
+			"ipv6-address": [ { "address": "2001:db8:2000::1", "mask": 64 } ],
+			"data": {}
+		},
+		{
+			"interface": "masqoff",
+			"up": true,
+			"l3_device": "eth3",
+			"proto": "static",
+			"device": "eth3",
+			"ipv4-address": [ { "address": "203.0.113.1", "mask": 24 } ],
+			"data": {}
+		},
+		{
+			"interface": "lan",
+			"up": true,
+			"l3_device": "br-lan",
+			"proto": "static",
+			"device": "br-lan",
+			"ipv4-address": [ { "address": "192.168.26.1", "mask": 24 } ],
+			"ipv6-address": [ { "address": "2001:db8:1000:1::1", "mask": 64 } ],
+			"data": {}
+		},
+		{
+			"interface": "noaddr",
+			"up": true,
+			"l3_device": "wwan0",
+			"proto": "static",
+			"device": "wwan0",
+			"data": {}
+		}
+	]
+}
+-- End --
+
+-- File uci/firewall.json --
+{
+	"zone": [
+		{
+			"name": "wan",
+			"network": [ "wan", "wan6" ],
+			"masq": 0,
+			"masq6": 0,
+			"auto_helper": 0
+		},
+		{
+			"name": "routed",
+			"network": "routed",
+			"masq": 0,
+			"masq6": 0,
+			"reflection": 1,
+			"auto_helper": 0
+		},
+		{
+			"name": "masqoff",
+			"network": "masqoff",
+			"masq": 1,
+			"reflection": 0,
+			"auto_helper": 0
+		},
+		{
+			"name": "lan",
+			"network": "lan",
+			"auto_helper": 0
+		},
+		{
+			"name": "noaddr",
+			"network": [ "noaddr" ],
+			"auto_helper": 0
+		}
+	],
+	"redirect": [
+		{
+			"name": "HTTP redirect explicit",
+			"src": "wan",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": "80",
+			"dest_ip": "192.168.26.100",
+			"dest_port": "80",
+			"target": "dnat",
+			"reflection": 1
+		},
+		{
+			"name": "HTTPS IPv6 redirect explicit",
+			"family": "ipv6",
+			"src": "wan",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": "443",
+			"dest_ip": "2001:db8:1000:1::1234",
+			"dest_port": "443",
+			"target": "dnat",
+			"reflection": 1
+		},
+		{
+			"name": "SSH redirect reflection disabled",
+			"src": "wan",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": "2222",
+			"dest_ip": "192.168.26.100",
+			"dest_port": "22",
+			"target": "dnat",
+			"reflection": 0
+		},
+		{
+			"name": "Unmasq zone omitted reflection",
+			"src": "wan",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": "8000",
+			"dest_ip": "192.168.26.100",
+			"dest_port": "8000",
+			"target": "dnat"
+		},
+		{
+			"name": "Explicit reflection_zone opt-in",
+			"src": "wan",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": "8001",
+			"dest_ip": "192.168.26.100",
+			"dest_port": "8001",
+			"target": "dnat",
+			"reflection_zone": [ "lan" ]
+		},
+		{
+			"name": "Routed zone default IPv4",
+			"src": "routed",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": "8081",
+			"dest_ip": "192.168.26.100",
+			"dest_port": "8081",
+			"target": "dnat"
+		},
+		{
+			"name": "Routed zone default IPv6",
+			"family": "ipv6",
+			"src": "routed",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": "8443",
+			"dest_ip": "2001:db8:1000:1::1234",
+			"dest_port": "8443",
+			"target": "dnat"
+		},
+		{
+			"name": "Routed zone redirect opt-out",
+			"src": "routed",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": "8082",
+			"dest_ip": "192.168.26.100",
+			"dest_port": "8082",
+			"target": "dnat",
+			"reflection": 0
+		},
+		{
+			"name": "Masq zone reflection disabled",
+			"src": "masqoff",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": "9000",
+			"dest_ip": "192.168.26.100",
+			"dest_port": "9000",
+			"target": "dnat"
+		},
+		{
+			"name": "Masq zone explicit redirect override",
+			"src": "masqoff",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": "9001",
+			"dest_ip": "192.168.26.100",
+			"dest_port": "9001",
+			"target": "dnat",
+			"reflection": 1
+		},
+		{
+			"name": "Same-zone DNS hijack auto",
+			"src": "lan",
+			"dest": "lan",
+			"proto": "udp",
+			"src_ip": "!192.168.26.53",
+			"src_dport": "53",
+			"dest_ip": "192.168.26.53",
+			"dest_port": "53",
+			"target": "dnat"
+		},
+		{
+			"name": "Same-zone explicit reflection",
+			"src": "lan",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": "5353",
+			"dest_ip": "192.168.26.53",
+			"dest_port": "5353",
+			"target": "dnat",
+			"reflection": 1
+		},
+		{
+			"name": "Same-zone DNS hijack explicit reflection",
+			"src": "lan",
+			"dest": "lan",
+			"proto": "udp",
+			"src_ip": "!192.168.26.53",
+			"src_dip": "!192.168.26.1",
+			"src_dport": "5354",
+			"dest_ip": "192.168.26.53",
+			"dest_port": "53",
+			"target": "dnat",
+			"reflection": 1
+		},
+		{
+			"name": "Negated src_dip explicit reflection",
+			"src": "wan",
+			"dest": "lan",
+			"proto": "udp",
+			"src_dip": "!10.11.12.194",
+			"src_dport": "53",
+			"dest_ip": "192.168.26.53",
+			"dest_port": "53",
+			"target": "dnat",
+			"reflection": 1
+		},
+		{
+			"name": "Missing IP redirect explicit",
+			"src": "noaddr",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": "8080",
+			"dest_ip": "192.168.26.100",
+			"target": "dnat",
+			"reflection": 1
+		},
+		{
+			"name": "Missing IP redirect auto",
+			"src": "noaddr",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": "8089",
+			"dest_ip": "192.168.26.100",
+			"target": "dnat"
+		}
+	]
+}
+-- End --
+
+-- Expect stderr --
+[!] Section @redirect[13] (Negated src_dip explicit reflection) cannot reflect redirect with negated 'src_dip', disabling reflection
+[!] Section @redirect[14] (Missing IP redirect explicit) external address range cannot be determined, disabling reflection
+-- End --
+
+-- Expect stdout --
+table inet fw4
+flush table inet fw4
+
+table inet fw4 {
+	#
+	# Defines
+	#
+
+	define wan_devices = { "pppoe-wan" }
+	define wan_subnets = { 10.11.12.0/24, 2001:db8:54:321::/64 }
+
+	define routed_devices = { "eth2" }
+	define routed_subnets = { 198.51.100.0/24, 2001:db8:2000::/64 }
+
+	define masqoff_devices = { "eth3" }
+	define masqoff_subnets = { 203.0.113.0/24 }
+
+	define lan_devices = { "br-lan" }
+	define lan_subnets = { 192.168.26.0/24, 2001:db8:1000:1::/64 }
+
+	define noaddr_devices = { "wwan0" }
+	define noaddr_subnets = {  }
+
+
+	#
+	# User includes
+	#
+
+	include "/etc/nftables.d/*.nft"
+
+
+	#
+	# Filter rules
+	#
+
+	chain input {
+		type filter hook input priority filter; policy drop;
+
+		iif "lo" accept comment "!fw4: Accept traffic from loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle inbound flows"
+		iifname "pppoe-wan" jump input_wan comment "!fw4: Handle wan IPv4/IPv6 input traffic"
+		iifname "eth2" jump input_routed comment "!fw4: Handle routed IPv4/IPv6 input traffic"
+		iifname "eth3" jump input_masqoff comment "!fw4: Handle masqoff IPv4/IPv6 input traffic"
+		iifname "br-lan" jump input_lan comment "!fw4: Handle lan IPv4/IPv6 input traffic"
+		iifname "wwan0" jump input_noaddr comment "!fw4: Handle noaddr IPv4/IPv6 input traffic"
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle forwarded flows"
+		iifname "pppoe-wan" jump forward_wan comment "!fw4: Handle wan IPv4/IPv6 forward traffic"
+		iifname "eth2" jump forward_routed comment "!fw4: Handle routed IPv4/IPv6 forward traffic"
+		iifname "eth3" jump forward_masqoff comment "!fw4: Handle masqoff IPv4/IPv6 forward traffic"
+		iifname "br-lan" jump forward_lan comment "!fw4: Handle lan IPv4/IPv6 forward traffic"
+		iifname "wwan0" jump forward_noaddr comment "!fw4: Handle noaddr IPv4/IPv6 forward traffic"
+	}
+
+	chain output {
+		type filter hook output priority filter; policy drop;
+
+		oif "lo" accept comment "!fw4: Accept traffic towards loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle outbound flows"
+		oifname "pppoe-wan" jump output_wan comment "!fw4: Handle wan IPv4/IPv6 output traffic"
+		oifname "eth2" jump output_routed comment "!fw4: Handle routed IPv4/IPv6 output traffic"
+		oifname "eth3" jump output_masqoff comment "!fw4: Handle masqoff IPv4/IPv6 output traffic"
+		oifname "br-lan" jump output_lan comment "!fw4: Handle lan IPv4/IPv6 output traffic"
+		oifname "wwan0" jump output_noaddr comment "!fw4: Handle noaddr IPv4/IPv6 output traffic"
+	}
+
+	chain prerouting {
+		type filter hook prerouting priority filter; policy accept;
+	}
+
+	chain handle_reject {
+		meta l4proto tcp reject with tcp reset comment "!fw4: Reject TCP traffic"
+		reject with icmpx type port-unreachable comment "!fw4: Reject any other traffic"
+	}
+
+	chain input_wan {
+		ct status dnat accept comment "!fw4: Accept port redirections"
+		jump drop_from_wan
+	}
+
+	chain output_wan {
+		jump drop_to_wan
+	}
+
+	chain forward_wan {
+		ct status dnat accept comment "!fw4: Accept port forwards"
+		jump drop_to_wan
+	}
+
+	chain drop_from_wan {
+		iifname "pppoe-wan" counter drop comment "!fw4: drop wan IPv4/IPv6 traffic"
+	}
+
+	chain drop_to_wan {
+		oifname "pppoe-wan" counter drop comment "!fw4: drop wan IPv4/IPv6 traffic"
+	}
+
+	chain input_routed {
+		ct status dnat accept comment "!fw4: Accept port redirections"
+		jump drop_from_routed
+	}
+
+	chain output_routed {
+		jump drop_to_routed
+	}
+
+	chain forward_routed {
+		ct status dnat accept comment "!fw4: Accept port forwards"
+		jump drop_to_routed
+	}
+
+	chain drop_from_routed {
+		iifname "eth2" counter drop comment "!fw4: drop routed IPv4/IPv6 traffic"
+	}
+
+	chain drop_to_routed {
+		oifname "eth2" counter drop comment "!fw4: drop routed IPv4/IPv6 traffic"
+	}
+
+	chain input_masqoff {
+		ct status dnat accept comment "!fw4: Accept port redirections"
+		jump drop_from_masqoff
+	}
+
+	chain output_masqoff {
+		jump drop_to_masqoff
+	}
+
+	chain forward_masqoff {
+		ct status dnat accept comment "!fw4: Accept port forwards"
+		jump drop_to_masqoff
+	}
+
+	chain drop_from_masqoff {
+		iifname "eth3" counter drop comment "!fw4: drop masqoff IPv4/IPv6 traffic"
+	}
+
+	chain drop_to_masqoff {
+		oifname "eth3" counter drop comment "!fw4: drop masqoff IPv4/IPv6 traffic"
+	}
+
+	chain input_lan {
+		ct status dnat accept comment "!fw4: Accept port redirections"
+		jump drop_from_lan
+	}
+
+	chain output_lan {
+		jump drop_to_lan
+	}
+
+	chain forward_lan {
+		ct status dnat accept comment "!fw4: Accept port forwards"
+		jump drop_to_lan
+	}
+
+	chain drop_from_lan {
+		iifname "br-lan" counter drop comment "!fw4: drop lan IPv4/IPv6 traffic"
+	}
+
+	chain drop_to_lan {
+		oifname "br-lan" counter drop comment "!fw4: drop lan IPv4/IPv6 traffic"
+	}
+
+	chain input_noaddr {
+		ct status dnat accept comment "!fw4: Accept port redirections"
+		jump drop_from_noaddr
+	}
+
+	chain output_noaddr {
+		jump drop_to_noaddr
+	}
+
+	chain forward_noaddr {
+		ct status dnat accept comment "!fw4: Accept port forwards"
+		jump drop_to_noaddr
+	}
+
+	chain drop_from_noaddr {
+		iifname "wwan0" counter drop comment "!fw4: drop noaddr IPv4/IPv6 traffic"
+	}
+
+	chain drop_to_noaddr {
+		oifname "wwan0" counter drop comment "!fw4: drop noaddr IPv4/IPv6 traffic"
+	}
+
+
+	#
+	# NAT rules
+	#
+
+	chain dstnat {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "pppoe-wan" jump dstnat_wan comment "!fw4: Handle wan IPv4/IPv6 dstnat traffic"
+		iifname "eth2" jump dstnat_routed comment "!fw4: Handle routed IPv4/IPv6 dstnat traffic"
+		iifname "eth3" jump dstnat_masqoff comment "!fw4: Handle masqoff IPv4/IPv6 dstnat traffic"
+		iifname "br-lan" jump dstnat_lan comment "!fw4: Handle lan IPv4/IPv6 dstnat traffic"
+		iifname "wwan0" jump dstnat_noaddr comment "!fw4: Handle noaddr IPv4/IPv6 dstnat traffic"
+	}
+
+	chain srcnat {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "eth3" jump srcnat_masqoff comment "!fw4: Handle masqoff IPv4/IPv6 srcnat traffic"
+		oifname "br-lan" jump srcnat_lan comment "!fw4: Handle lan IPv4/IPv6 srcnat traffic"
+	}
+
+	chain dstnat_wan {
+		meta nfproto ipv4 tcp dport 80 counter dnat 192.168.26.100:80 comment "!fw4: HTTP redirect explicit"
+		meta nfproto ipv6 tcp dport 443 counter dnat [2001:db8:1000:1::1234]:443 comment "!fw4: HTTPS IPv6 redirect explicit"
+		meta nfproto ipv4 tcp dport 2222 counter dnat 192.168.26.100:22 comment "!fw4: SSH redirect reflection disabled"
+		meta nfproto ipv4 tcp dport 8000 counter dnat 192.168.26.100:8000 comment "!fw4: Unmasq zone omitted reflection"
+		meta nfproto ipv4 tcp dport 8001 counter dnat 192.168.26.100:8001 comment "!fw4: Explicit reflection_zone opt-in"
+		ip daddr != 10.11.12.194 udp dport 53 counter dnat 192.168.26.53:53 comment "!fw4: Negated src_dip explicit reflection"
+	}
+
+	chain dstnat_routed {
+		meta nfproto ipv4 tcp dport 8081 counter dnat 192.168.26.100:8081 comment "!fw4: Routed zone default IPv4"
+		meta nfproto ipv6 tcp dport 8443 counter dnat [2001:db8:1000:1::1234]:8443 comment "!fw4: Routed zone default IPv6"
+		meta nfproto ipv4 tcp dport 8082 counter dnat 192.168.26.100:8082 comment "!fw4: Routed zone redirect opt-out"
+	}
+
+	chain dstnat_masqoff {
+		meta nfproto ipv4 tcp dport 9000 counter dnat 192.168.26.100:9000 comment "!fw4: Masq zone reflection disabled"
+		meta nfproto ipv4 tcp dport 9001 counter dnat 192.168.26.100:9001 comment "!fw4: Masq zone explicit redirect override"
+	}
+
+	chain srcnat_masqoff {
+		meta nfproto ipv4 masquerade comment "!fw4: Masquerade IPv4 masqoff traffic"
+	}
+
+	chain dstnat_lan {
+		ip saddr 192.168.26.0/24 ip daddr 10.11.12.194 tcp dport 80 dnat 192.168.26.100:80 comment "!fw4: HTTP redirect explicit (reflection)"
+		ip6 saddr 2001:db8:1000:1::/64 ip6 daddr 2001:db8:54:321::2 tcp dport 443 dnat [2001:db8:1000:1::1234]:443 comment "!fw4: HTTPS IPv6 redirect explicit (reflection)"
+		ip saddr 192.168.26.0/24 ip daddr 10.11.12.194 tcp dport 8001 dnat 192.168.26.100:8001 comment "!fw4: Explicit reflection_zone opt-in (reflection)"
+		ip saddr 192.168.26.0/24 ip daddr 198.51.100.1 tcp dport 8081 dnat 192.168.26.100:8081 comment "!fw4: Routed zone default IPv4 (reflection)"
+		ip6 saddr 2001:db8:1000:1::/64 ip6 daddr 2001:db8:2000::1 tcp dport 8443 dnat [2001:db8:1000:1::1234]:8443 comment "!fw4: Routed zone default IPv6 (reflection)"
+		ip saddr 192.168.26.0/24 ip daddr 203.0.113.1 tcp dport 9001 dnat 192.168.26.100:9001 comment "!fw4: Masq zone explicit redirect override (reflection)"
+		ip saddr != 192.168.26.53 udp dport 53 counter dnat 192.168.26.53:53 comment "!fw4: Same-zone DNS hijack auto"
+		meta nfproto ipv4 tcp dport 5353 counter dnat 192.168.26.53:5353 comment "!fw4: Same-zone explicit reflection"
+		ip saddr != 192.168.26.53 ip daddr != 192.168.26.1 udp dport 5354 counter dnat 192.168.26.53:53 comment "!fw4: Same-zone DNS hijack explicit reflection"
+	}
+
+	chain srcnat_lan {
+		ip saddr 192.168.26.0/24 ip daddr 192.168.26.100 tcp dport 80 snat 192.168.26.1 comment "!fw4: HTTP redirect explicit (reflection)"
+		ip6 saddr 2001:db8:1000:1::/64 ip6 daddr 2001:db8:1000:1::1234 tcp dport 443 snat 2001:db8:1000:1::1 comment "!fw4: HTTPS IPv6 redirect explicit (reflection)"
+		ip saddr 192.168.26.0/24 ip daddr 192.168.26.100 tcp dport 8001 snat 192.168.26.1 comment "!fw4: Explicit reflection_zone opt-in (reflection)"
+		ip saddr 192.168.26.0/24 ip daddr 192.168.26.100 tcp dport 8081 snat 192.168.26.1 comment "!fw4: Routed zone default IPv4 (reflection)"
+		ip6 saddr 2001:db8:1000:1::/64 ip6 daddr 2001:db8:1000:1::1234 tcp dport 8443 snat 2001:db8:1000:1::1 comment "!fw4: Routed zone default IPv6 (reflection)"
+		ip saddr 192.168.26.0/24 ip daddr 192.168.26.100 tcp dport 9001 snat 192.168.26.1 comment "!fw4: Masq zone explicit redirect override (reflection)"
+		ct status dnat ip saddr 192.168.26.0/24 ip daddr 192.168.26.53 tcp dport 5353 snat 192.168.26.1 comment "!fw4: Same-zone explicit reflection (reflection)"
+		ct status dnat ip saddr 192.168.26.0/24 ip daddr 192.168.26.53 udp dport 53 snat 192.168.26.1 comment "!fw4: Same-zone DNS hijack explicit reflection (reflection)"
+	}
+
+	chain dstnat_noaddr {
+		meta nfproto ipv4 tcp dport 8080 counter dnat 192.168.26.100:8080 comment "!fw4: Missing IP redirect explicit"
+		meta nfproto ipv4 tcp dport 8089 counter dnat 192.168.26.100:8089 comment "!fw4: Missing IP redirect auto"
+	}
+
+
+	#
+	# Raw rules (notrack)
+	#
+
+	chain raw_prerouting {
+		type filter hook prerouting priority raw; policy accept;
+	}
+
+	chain raw_output {
+		type filter hook output priority raw; policy accept;
+	}
+
+
+	#
+	# Mangle rules
+	#
+
+	chain mangle_prerouting {
+		type filter hook prerouting priority mangle; policy accept;
+	}
+
+	chain mangle_postrouting {
+		type filter hook postrouting priority mangle; policy accept;
+	}
+
+	chain mangle_input {
+		type filter hook input priority mangle; policy accept;
+	}
+
+	chain mangle_output {
+		type route hook output priority mangle; policy accept;
+	}
+
+	chain mangle_forward {
+		type filter hook forward priority mangle; policy accept;
+	}
+}
+-- End --
