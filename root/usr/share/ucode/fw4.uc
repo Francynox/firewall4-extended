@@ -2807,12 +2807,6 @@ return {
 			if (!redir.dest_port)
 				redir.dest_port = redir.src_dport;
 
-			if (redir.reflection && redir.dest?.zone && redir.src.zone.masq) {
-				redir.dest.zone.dflags.accept = true;
-				redir.dest.zone.dflags.dnat = true;
-				redir.dest.zone.dflags.snat = true;
-			}
-
 			if (redir.helper)
 				redir.src.zone.dflags.helper = true;
 
@@ -2993,7 +2987,7 @@ return {
 					let refaddrs = (redir.reflection_src == "internal") ? iaddrs : eaddrs;
 
 					for (let i = 0; i <= 1; i++) {
-						if (redir.src.zone[i ? "masq6" : "masq"] && length(rip[i])) {
+						if (length(rip[i])) {
 							let snat_addr = refaddrs[i]?.[0];
 
 							/* For internal reflection sources try to find a suitable candiate IP
