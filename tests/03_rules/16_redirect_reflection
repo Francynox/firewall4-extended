@@ -391,7 +391,6 @@ table inet fw4 {
 	}
 
 	chain input_wan {
-		ct status dnat accept comment "!fw4: Accept port redirections"
 		jump drop_from_wan
 	}
 
@@ -400,7 +399,12 @@ table inet fw4 {
 	}
 
 	chain forward_wan {
-		ct status dnat accept comment "!fw4: Accept port forwards"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 80 counter jump accept_to_lan comment "!fw4: HTTP redirect explicit"
+		ct status dnat ip6 daddr 2001:db8:1000:1::1234 tcp dport 443 counter jump accept_to_lan comment "!fw4: HTTPS IPv6 redirect explicit"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 22 counter jump accept_to_lan comment "!fw4: SSH redirect reflection disabled"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 8000 counter jump accept_to_lan comment "!fw4: Unmasq zone omitted reflection"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 8001 counter jump accept_to_lan comment "!fw4: Explicit reflection_zone opt-in"
+		ct status dnat ip daddr 192.168.26.53 udp dport 53 counter jump accept_to_lan comment "!fw4: Negated src_dip explicit reflection"
 		jump drop_to_wan
 	}
 
@@ -413,7 +417,6 @@ table inet fw4 {
 	}
 
 	chain input_routed {
-		ct status dnat accept comment "!fw4: Accept port redirections"
 		jump drop_from_routed
 	}
 
@@ -422,7 +425,9 @@ table inet fw4 {
 	}
 
 	chain forward_routed {
-		ct status dnat accept comment "!fw4: Accept port forwards"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 8081 counter jump accept_to_lan comment "!fw4: Routed zone default IPv4"
+		ct status dnat ip6 daddr 2001:db8:1000:1::1234 tcp dport 8443 counter jump accept_to_lan comment "!fw4: Routed zone default IPv6"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 8082 counter jump accept_to_lan comment "!fw4: Routed zone redirect opt-out"
 		jump drop_to_routed
 	}
 
@@ -435,7 +440,6 @@ table inet fw4 {
 	}
 
 	chain input_masqoff {
-		ct status dnat accept comment "!fw4: Accept port redirections"
 		jump drop_from_masqoff
 	}
 
@@ -444,7 +448,8 @@ table inet fw4 {
 	}
 
 	chain forward_masqoff {
-		ct status dnat accept comment "!fw4: Accept port forwards"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 9000 counter jump accept_to_lan comment "!fw4: Masq zone reflection disabled"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 9001 counter jump accept_to_lan comment "!fw4: Masq zone explicit redirect override"
 		jump drop_to_masqoff
 	}
 
@@ -457,7 +462,6 @@ table inet fw4 {
 	}
 
 	chain input_lan {
-		ct status dnat accept comment "!fw4: Accept port redirections"
 		jump drop_from_lan
 	}
 
@@ -466,8 +470,19 @@ table inet fw4 {
 	}
 
 	chain forward_lan {
-		ct status dnat accept comment "!fw4: Accept port forwards"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 80 counter jump accept_to_lan comment "!fw4: HTTP redirect explicit (reflection)"
+		ct status dnat ip6 daddr 2001:db8:1000:1::1234 tcp dport 443 counter jump accept_to_lan comment "!fw4: HTTPS IPv6 redirect explicit (reflection)"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 8001 counter jump accept_to_lan comment "!fw4: Explicit reflection_zone opt-in (reflection)"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 8081 counter jump accept_to_lan comment "!fw4: Routed zone default IPv4 (reflection)"
+		ct status dnat ip6 daddr 2001:db8:1000:1::1234 tcp dport 8443 counter jump accept_to_lan comment "!fw4: Routed zone default IPv6 (reflection)"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 9001 counter jump accept_to_lan comment "!fw4: Masq zone explicit redirect override (reflection)"
+		ct status dnat ip saddr != 192.168.26.53 ip daddr 192.168.26.53 udp dport 53 counter jump accept_to_lan comment "!fw4: Same-zone DNS hijack auto"
+		ct status dnat ip daddr 192.168.26.53 tcp dport 5353 counter jump accept_to_lan comment "!fw4: Same-zone explicit reflection"
 		jump drop_to_lan
+	}
+
+	chain accept_to_lan {
+		oifname "br-lan" counter accept comment "!fw4: accept lan IPv4/IPv6 traffic"
 	}
 
 	chain drop_from_lan {
@@ -479,7 +494,6 @@ table inet fw4 {
 	}
 
 	chain input_noaddr {
-		ct status dnat accept comment "!fw4: Accept port redirections"
 		jump drop_from_noaddr
 	}
 
@@ -488,7 +502,8 @@ table inet fw4 {
 	}
 
 	chain forward_noaddr {
-		ct status dnat accept comment "!fw4: Accept port forwards"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 8080 counter jump accept_to_lan comment "!fw4: Missing IP redirect explicit"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 8089 counter jump accept_to_lan comment "!fw4: Missing IP redirect auto"
 		jump drop_to_noaddr
 	}
 
