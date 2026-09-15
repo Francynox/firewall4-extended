@@ -1868,6 +1868,79 @@ return {
 		return filter(this.state.redirects, r => (r.chain == chain));
 	},
 
+	dnat_filter_rules: function(chain) {
+		return filter(this.state.dnat_filter_rules || [], r => (r.chain == chain));
+	},
+
+	append_dnat_filter_rule: function(filter_rule) {
+		let rule_key = (r) => sprintf("%J", [
+			r.chain, r.family, r.proto?.name, r.target, r.jump_chain,
+			r.daddrs_pos, r.daddrs_neg, r.daddrs_masked,
+			r.dports_pos, r.dports_neg,
+			r.saddrs_pos, r.saddrs_neg, r.saddrs_masked,
+			r.sports_pos, r.sports_neg,
+			r.smacs_pos, r.smacs_neg,
+			r.ipset?.name,
+			r.start_date, r.stop_date,
+			r.start_time, r.stop_time,
+			r.weekdays
+		]);
+
+		let k = rule_key(filter_rule);
+		this.state.seen_dnat_filter_rules ||= {};
+
+		if (this.state.seen_dnat_filter_rules[k])
+			return;
+
+		this.state.seen_dnat_filter_rules[k] = true;
+		push(this.state.dnat_filter_rules ||= [], filter_rule);
+	},
+
+	create_dnat_filter_rule: function(redir, opts) {
+		let is_local = opts.is_local;
+		let src_zone = opts.src_zone;
+		let dest_zone = opts.dest_zone;
+
+		let chain = opts.chain || (is_local ? `input_${src_zone.name}` : `forward_${src_zone.name}`);
+		let jump_chain = opts.jump_chain || ((is_local || !dest_zone) ? null : `accept_to_${dest_zone.name}`);
+		let target = exists(opts, "target") ? opts.target : ((is_local || !dest_zone) ? "accept" : null);
+
+		let dports_pos = length(opts.dports_pos) ? opts.dports_pos : null;
+		let dports_neg = length(opts.dports_neg) ? opts.dports_neg : null;
+		let daddrs_pos = length(opts.daddrs_pos) ? opts.daddrs_pos : null;
+
+		let filter_rule = {
+			...redir,
+			...opts,
+
+			chain: chain,
+			jump_chain: jump_chain,
+			target: target,
+			dnat: true,
+			has_addrs: !!(length(daddrs_pos) || length(opts.saddrs_pos) || length(opts.saddrs_neg) || length(opts.saddrs_masked)),
+			has_ports: !!(length(dports_pos) || length(opts.sports_pos) || length(opts.sports_neg)),
+
+			daddrs_pos: daddrs_pos,
+			dports_pos: dports_pos,
+			dports_neg: dports_neg,
+
+			counter: (opts.counter != null) ? opts.counter : redir.counter
+		};
+
+		delete filter_rule.dest_zone;
+		delete filter_rule.src_zone;
+		delete filter_rule.is_local;
+		delete filter_rule.mark;
+		delete filter_rule.helper;
+		delete filter_rule.limit;
+		delete filter_rule.limit_burst;
+
+		if (dest_zone && !is_local)
+			dest_zone.dflags.accept = true;
+
+		this.append_dnat_filter_rule(filter_rule);
+	},
+
 	ipsets: function() {
 		return this.state.ipsets;
 	},
@@ -2719,6 +2792,8 @@ return {
 
 			reflection_zone: [ "zone_ref", null, PARSE_LIST ],
 
+			filter_rule: [ "bool", "1" ],
+
 			counter: [ "bool", "1" ],
 			log: [ "string" ],
 			log_limit: [ "limit" ],
@@ -2831,9 +2906,26 @@ return {
 			redir.dest.zone.dflags[redir.target] = true;
 		}
 
-		let add_rule = (family, proto, saddrs, daddrs, raddrs, sport, dport, rport, ipset, redir) => {
+		let is_local_addr = (addr) => {
+			if (!addr)
+				return true;
+
+			if (this.is_loopback_addr(addr.addr))
+				return true;
+
+			for (let netname, net in this.state.networks) {
+				for (let ip in net.ipaddrs) {
+					if (ip.family == addr.family && ip.addr == addr.addr)
+						return true;
+				}
+			}
+
+			return false;
+		};
+
+		let add_rule = (family, proto, saddrs, daddrs, raddrs, sport, dport, rport, ipset, reflection_redir) => {
 			let r = {
-				...redir,
+				...(reflection_redir || redir),
 
 				family: family,
 				proto: proto,
@@ -2882,6 +2974,43 @@ return {
 			}
 
 			push(this.state.redirects ||= [], r);
+
+			let is_local = is_local_addr(r.raddr);
+			let is_port_forward = (r.target == "dnat" && r.raddr && !is_local);
+			let is_port_redirection = ((r.target == "dnat" || r.target == "redirect") && is_local);
+
+			if (r.filter_rule && (is_port_forward || is_port_redirection)) {
+				this.create_dnat_filter_rule(redir, {
+					name: r.name,
+					is_local: is_local,
+					src_zone: r.src.zone,
+					dest_zone: r.dest?.zone,
+
+					family: family,
+					proto: proto,
+
+					saddrs_pos: r.saddrs_pos,
+					saddrs_neg: r.saddrs_neg,
+					saddrs_masked: r.saddrs_masked,
+
+					daddrs_pos: r.raddr ? [ this.cidr(r.raddr) ] : null,
+
+					sports_pos: r.sports_pos,
+					sports_neg: r.sports_neg,
+
+					dports_pos: map(filter_pos(to_array(r.rport)), this.port),
+					dports_neg: map(filter_neg(to_array(r.rport)), this.port),
+
+					smacs_pos: r.smacs_pos,
+					smacs_neg: r.smacs_neg,
+
+					ipset: r.ipset,
+
+					counter: r.counter,
+					log: r.log,
+					log_limit: r.log_limit
+				});
+			}
 		};
 
 		let to_hostaddr = (a) => {
@@ -2970,7 +3099,8 @@ return {
 					stop_time: redir.stop_time,
 					weekdays: redir.weekdays,
 
-					mark: redir.mark
+					mark: redir.mark,
+					filter_rule: false
 				};
 
 				let eaddrs = length(dip) ? dip : subnets_split_af({ addrs: map(redir.src.zone.related_subnets, to_hostaddr) });
@@ -3035,6 +3165,28 @@ return {
 								for (let daddrs in subnets_group_by_masking(rip[i]))
 									for (let saddrs in subnets_group_by_masking(iaddrs[i]))
 										add_rule(i ? 6 : 4, proto, saddrs, daddrs, [ to_hostaddr(snat_addr) ], null, rport, null, null, refredir);
+
+								if (redir.filter_rule) {
+									let is_local = is_local_addr(rip[i][0]);
+
+									for (let saddrs in (is_local ? subnets_group_by_masking(iaddrs[i]) : [ null ])) {
+										this.create_dnat_filter_rule(redir, {
+											name: `${redir.name} (reflection)`,
+											is_local: is_local,
+											src_zone: rzone.zone,
+											dest_zone: redir.dest?.zone,
+
+											family: i ? 6 : 4,
+											proto: proto,
+
+											saddrs_pos: saddrs?.[0] ? map(saddrs[0], this.cidr) : null,
+											daddrs_pos: map(rip[i], this.cidr),
+											dports_pos: map(filter_pos(to_array(rport)), this.port),
+											dports_neg: map(filter_neg(to_array(rport)), this.port),
+											ipset: null
+										});
+									}
+								}
 							}
 						}
 					}

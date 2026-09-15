@@ -162,7 +162,6 @@ table inet fw4 {
 	}
 
 	chain input_wan {
-		ct status dnat accept comment "!fw4: Accept port redirections"
 		jump drop_from_wan
 	}
 
@@ -171,7 +170,9 @@ table inet fw4 {
 	}
 
 	chain forward_wan {
-		ct status dnat accept comment "!fw4: Accept port forwards"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 80 counter jump accept_to_lan comment "!fw4: HTTP redirect"
+		ct status dnat ip6 daddr 2001:db8:1000:1::1234 tcp dport 443 counter jump accept_to_lan comment "!fw4: HTTPS IPv6 redirect"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 22 counter jump accept_to_lan comment "!fw4: SSH redirect reflection disabled"
 		jump drop_to_wan
 	}
 
@@ -184,7 +185,6 @@ table inet fw4 {
 	}
 
 	chain input_lan {
-		ct status dnat accept comment "!fw4: Accept port redirections"
 		jump drop_from_lan
 	}
 
@@ -193,8 +193,13 @@ table inet fw4 {
 	}
 
 	chain forward_lan {
-		ct status dnat accept comment "!fw4: Accept port forwards"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 80 counter jump accept_to_lan comment "!fw4: HTTP redirect (reflection)"
+		ct status dnat ip6 daddr 2001:db8:1000:1::1234 tcp dport 443 counter jump accept_to_lan comment "!fw4: HTTPS IPv6 redirect (reflection)"
 		jump drop_to_lan
+	}
+
+	chain accept_to_lan {
+		oifname "br-lan" counter accept comment "!fw4: accept lan IPv4/IPv6 traffic"
 	}
 
 	chain drop_from_lan {
@@ -206,7 +211,6 @@ table inet fw4 {
 	}
 
 	chain input_noaddr {
-		ct status dnat accept comment "!fw4: Accept port redirections"
 		jump drop_from_noaddr
 	}
 
@@ -215,7 +219,7 @@ table inet fw4 {
 	}
 
 	chain forward_noaddr {
-		ct status dnat accept comment "!fw4: Accept port forwards"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 8080 counter jump accept_to_lan comment "!fw4: Missing IP redirect"
 		jump drop_to_noaddr
 	}
 

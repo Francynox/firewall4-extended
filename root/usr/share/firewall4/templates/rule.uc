@@ -1,3 +1,5 @@
+{%+ if (rule.dnat): -%}
+	ct status dnat {%+ endif -%}
 {%+ if (rule.family && !rule.has_addrs): -%}
 	meta nfproto {{ fw4.nfproto(rule.family) }} {%+ endif -%}
 {%+ if (!rule.proto.any && !rule.has_ports && !rule.icmp_types && !rule.icmp_codes): -%}

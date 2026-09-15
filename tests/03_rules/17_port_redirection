@@ -1,0 +1,275 @@
+Test port redirections targeting local router addresses.
+
+-- Testcase --
+{%
+	include("./root/usr/share/firewall4/main.uc", {
+		getenv: function(varname) {
+			switch (varname) {
+			case 'ACTION':
+				return 'print';
+			}
+		}
+	})
+%}
+-- End --
+
+-- File uci/helpers.json --
+{}
+-- End --
+
+-- File fs/open~_sys_class_net_br-lan_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_eth1_flags.txt --
+0x1103
+-- End --
+
+-- File ubus/network.interface~dump.json --
+{
+	"interface": [
+		{
+			"interface": "lan",
+			"up": true,
+			"l3_device": "br-lan",
+			"proto": "static",
+			"device": "br-lan",
+			"ipv4-address": [ { "address": "192.168.1.1", "mask": 24 } ],
+			"data": {}
+		},
+		{
+			"interface": "wan",
+			"up": true,
+			"l3_device": "eth1",
+			"proto": "dhcp",
+			"device": "eth1",
+			"ipv4-address": [ { "address": "10.11.12.194", "mask": 24 } ],
+			"data": {}
+		}
+	]
+}
+-- End --
+
+-- File uci/firewall.json --
+{
+	"zone": [
+		{
+			"name": "wan",
+			"network": "wan",
+			"auto_helper": 0
+		},
+		{
+			"name": "lan",
+			"network": "lan",
+			"auto_helper": 0
+		}
+	],
+	"redirect": [
+		{
+			"name": "Port redirection",
+			"src": "wan",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": "8080",
+			"dest_ip": "192.168.1.1",
+			"dest_port": "80",
+			"target": "dnat"
+		},
+		{
+			"name": "Loopback port redirection",
+			"src": "lan",
+			"proto": "udp",
+			"src_dport": "5353",
+			"dest_ip": "127.0.0.1",
+			"dest_port": "53",
+			"target": "dnat"
+		},
+		{
+			"name": "Omitted dest_ip port redirection",
+			"src": "wan",
+			"proto": "tcp",
+			"src_dport": "2222",
+			"dest_port": "22",
+			"target": "dnat"
+		}
+	]
+}
+-- End --
+
+-- Expect stdout --
+table inet fw4
+flush table inet fw4
+
+table inet fw4 {
+	#
+	# Defines
+	#
+
+	define wan_devices = { "eth1" }
+	define wan_subnets = { 10.11.12.0/24 }
+
+	define lan_devices = { "br-lan" }
+	define lan_subnets = { 192.168.1.0/24 }
+
+
+	#
+	# User includes
+	#
+
+	include "/etc/nftables.d/*.nft"
+
+
+	#
+	# Filter rules
+	#
+
+	chain input {
+		type filter hook input priority filter; policy drop;
+
+		iif "lo" accept comment "!fw4: Accept traffic from loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle inbound flows"
+		iifname "eth1" jump input_wan comment "!fw4: Handle wan IPv4/IPv6 input traffic"
+		iifname "br-lan" jump input_lan comment "!fw4: Handle lan IPv4/IPv6 input traffic"
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle forwarded flows"
+		iifname "eth1" jump forward_wan comment "!fw4: Handle wan IPv4/IPv6 forward traffic"
+		iifname "br-lan" jump forward_lan comment "!fw4: Handle lan IPv4/IPv6 forward traffic"
+	}
+
+	chain output {
+		type filter hook output priority filter; policy drop;
+
+		oif "lo" accept comment "!fw4: Accept traffic towards loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle outbound flows"
+		oifname "eth1" jump output_wan comment "!fw4: Handle wan IPv4/IPv6 output traffic"
+		oifname "br-lan" jump output_lan comment "!fw4: Handle lan IPv4/IPv6 output traffic"
+	}
+
+	chain prerouting {
+		type filter hook prerouting priority filter; policy accept;
+	}
+
+	chain handle_reject {
+		meta l4proto tcp reject with tcp reset comment "!fw4: Reject TCP traffic"
+		reject with icmpx type port-unreachable comment "!fw4: Reject any other traffic"
+	}
+
+	chain input_wan {
+		ct status dnat ip daddr 192.168.1.1 tcp dport 80 counter accept comment "!fw4: Port redirection"
+		ct status dnat meta nfproto ipv4 tcp dport 22 counter accept comment "!fw4: Omitted dest_ip port redirection"
+		jump drop_from_wan
+	}
+
+	chain output_wan {
+		jump drop_to_wan
+	}
+
+	chain forward_wan {
+		jump drop_to_wan
+	}
+
+	chain drop_from_wan {
+		iifname "eth1" counter drop comment "!fw4: drop wan IPv4/IPv6 traffic"
+	}
+
+	chain drop_to_wan {
+		oifname "eth1" counter drop comment "!fw4: drop wan IPv4/IPv6 traffic"
+	}
+
+	chain input_lan {
+		ct status dnat ip saddr 192.168.1.0/24 ip daddr 192.168.1.1 tcp dport 80 counter accept comment "!fw4: Port redirection (reflection)"
+		ct status dnat ip daddr 127.0.0.1 udp dport 53 counter accept comment "!fw4: Loopback port redirection"
+		jump drop_from_lan
+	}
+
+	chain output_lan {
+		jump drop_to_lan
+	}
+
+	chain forward_lan {
+		jump drop_to_lan
+	}
+
+	chain drop_from_lan {
+		iifname "br-lan" counter drop comment "!fw4: drop lan IPv4/IPv6 traffic"
+	}
+
+	chain drop_to_lan {
+		oifname "br-lan" counter drop comment "!fw4: drop lan IPv4/IPv6 traffic"
+	}
+
+
+	#
+	# NAT rules
+	#
+
+	chain dstnat {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "eth1" jump dstnat_wan comment "!fw4: Handle wan IPv4/IPv6 dstnat traffic"
+		iifname "br-lan" jump dstnat_lan comment "!fw4: Handle lan IPv4/IPv6 dstnat traffic"
+	}
+
+	chain srcnat {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "br-lan" jump srcnat_lan comment "!fw4: Handle lan IPv4/IPv6 srcnat traffic"
+	}
+
+	chain dstnat_wan {
+		meta nfproto ipv4 tcp dport 8080 counter dnat 192.168.1.1:80 comment "!fw4: Port redirection"
+		meta nfproto ipv4 tcp dport 2222 counter redirect to 22 comment "!fw4: Omitted dest_ip port redirection"
+	}
+
+	chain dstnat_lan {
+		ip saddr 192.168.1.0/24 ip daddr 10.11.12.194 tcp dport 8080 dnat 192.168.1.1:80 comment "!fw4: Port redirection (reflection)"
+		meta nfproto ipv4 udp dport 5353 counter dnat 127.0.0.1:53 comment "!fw4: Loopback port redirection"
+	}
+
+	chain srcnat_lan {
+		ip saddr 192.168.1.0/24 ip daddr 192.168.1.1 tcp dport 80 snat 192.168.1.1 comment "!fw4: Port redirection (reflection)"
+	}
+
+
+	#
+	# Raw rules (notrack)
+	#
+
+	chain raw_prerouting {
+		type filter hook prerouting priority raw; policy accept;
+	}
+
+	chain raw_output {
+		type filter hook output priority raw; policy accept;
+	}
+
+
+	#
+	# Mangle rules
+	#
+
+	chain mangle_prerouting {
+		type filter hook prerouting priority mangle; policy accept;
+	}
+
+	chain mangle_postrouting {
+		type filter hook postrouting priority mangle; policy accept;
+	}
+
+	chain mangle_input {
+		type filter hook input priority mangle; policy accept;
+	}
+
+	chain mangle_output {
+		type route hook output priority mangle; policy accept;
+	}
+
+	chain mangle_forward {
+		type filter hook forward priority mangle; policy accept;
+	}
+}
+-- End --

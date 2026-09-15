@@ -180,7 +180,6 @@ table inet fw4 {
 	}
 
 	chain input_wan {
-		ct status dnat accept comment "!fw4: Accept port redirections"
 		jump drop_from_wan
 	}
 
@@ -189,7 +188,7 @@ table inet fw4 {
 	}
 
 	chain forward_wan {
-		ct status dnat accept comment "!fw4: Accept port forwards"
+		ct status dnat ip6 saddr & ::ffff == ::1 ip6 daddr ::99 counter jump accept_to_lan comment "!fw4: Mask rule #3"
 		jump drop_to_wan
 	}
 
@@ -202,7 +201,6 @@ table inet fw4 {
 	}
 
 	chain input_lan {
-		ct status dnat accept comment "!fw4: Accept port redirections"
 		jump drop_from_lan
 	}
 
@@ -211,8 +209,12 @@ table inet fw4 {
 	}
 
 	chain forward_lan {
-		ct status dnat accept comment "!fw4: Accept port forwards"
+		ct status dnat ip6 daddr ::99 counter jump accept_to_lan comment "!fw4: Mask rule #3 (reflection)"
 		jump drop_to_lan
+	}
+
+	chain accept_to_lan {
+		oifname "br-lan" counter accept comment "!fw4: accept lan IPv4/IPv6 traffic"
 	}
 
 	chain drop_from_lan {
@@ -224,7 +226,6 @@ table inet fw4 {
 	}
 
 	chain input_guest {
-		ct status dnat accept comment "!fw4: Accept port redirections"
 		jump drop_from_guest
 	}
 
@@ -233,7 +234,7 @@ table inet fw4 {
 	}
 
 	chain forward_guest {
-		ct status dnat accept comment "!fw4: Accept port forwards"
+		ct status dnat ip6 daddr ::99 counter jump accept_to_lan comment "!fw4: Mask rule #3 (reflection)"
 		jump drop_to_guest
 	}
 

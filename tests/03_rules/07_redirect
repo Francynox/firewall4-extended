@@ -201,7 +201,8 @@ table inet fw4 {
 	}
 
 	chain input_wan {
-		ct status dnat accept comment "!fw4: Accept port redirections"
+		ct status dnat meta nfproto ipv4 tcp dport 26 counter accept comment "!fw4: Redirect test #7"
+		ct status dnat meta nfproto ipv6 tcp dport 27 counter accept comment "!fw4: Redirect test #8"
 		jump drop_from_wan
 	}
 
@@ -210,7 +211,9 @@ table inet fw4 {
 	}
 
 	chain forward_wan {
-		ct status dnat accept comment "!fw4: Accept port forwards"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 22 counter jump accept_to_lan comment "!fw4: Redirect test #3"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 23 counter jump accept_to_lan comment "!fw4: Redirect test #4"
+		ct status dnat ip6 daddr 2001:db8:1000:1::1234 tcp dport 25 counter jump accept_to_lan comment "!fw4: Redirect test #6"
 		jump drop_to_wan
 	}
 
@@ -223,7 +226,8 @@ table inet fw4 {
 	}
 
 	chain input_lan {
-		ct status dnat accept comment "!fw4: Accept port redirections"
+		ct status dnat meta nfproto ipv4 udp dport 53 counter accept comment "!fw4: Redirect test #1"
+		ct status dnat udp dport 53 counter accept comment "!fw4: Redirect test #2"
 		jump drop_from_lan
 	}
 
@@ -232,7 +236,9 @@ table inet fw4 {
 	}
 
 	chain forward_lan {
-		ct status dnat accept comment "!fw4: Accept port forwards"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 22 counter jump accept_to_lan comment "!fw4: Redirect test #3 (reflection)"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 23 counter jump accept_to_lan comment "!fw4: Redirect test #4 (reflection)"
+		ct status dnat ip6 daddr 2001:db8:1000:1::1234 tcp dport 25 counter jump accept_to_lan comment "!fw4: Redirect test #6 (reflection)"
 		jump drop_to_lan
 	}
 
@@ -249,7 +255,6 @@ table inet fw4 {
 	}
 
 	chain input_noaddr {
-		ct status dnat accept comment "!fw4: Accept port redirections"
 		jump drop_from_noaddr
 	}
 
@@ -258,7 +263,7 @@ table inet fw4 {
 	}
 
 	chain forward_noaddr {
-		ct status dnat accept comment "!fw4: Accept port forwards"
+		ct status dnat ip daddr 192.168.26.100 tcp dport 24 counter jump accept_to_lan comment "!fw4: Redirect test #5"
 		jump drop_to_noaddr
 	}
 

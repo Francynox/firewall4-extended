@@ -224,9 +224,9 @@ table inet fw4 {
 {%  for (let rule in fw4.rules(`input_${zone.name}`)): %}
 		{%+ include("rule.uc", { fw4, zone, rule }) %}
 {%  endfor %}
-{%  if (zone.dflags.dnat): %}
-		ct status dnat accept comment "!fw4: Accept port redirections"
-{%  endif %}
+{%  for (let rule in fw4.dnat_filter_rules(`input_${zone.name}`)): %}
+		{%+ include("rule.uc", { fw4, zone, rule }) %}
+{%  endfor %}
 {%  fw4.includes('chain-append', `input_${zone.name}`) %}
 		jump {{ zone.input }}_from_{{ zone.name }}
 	}
@@ -245,9 +245,9 @@ table inet fw4 {
 {%  for (let rule in fw4.rules(`forward_${zone.name}`)): %}
 		{%+ include("rule.uc", { fw4, zone, rule }) %}
 {%  endfor %}
-{%  if (zone.dflags.dnat): %}
-		ct status dnat accept comment "!fw4: Accept port forwards"
-{%  endif %}
+{%  for (let rule in fw4.dnat_filter_rules(`forward_${zone.name}`)): %}
+		{%+ include("rule.uc", { fw4, zone, rule }) %}
+{%  endfor %}
 {%  fw4.includes('chain-append', `forward_${zone.name}`) %}
 		jump {{ zone.forward }}_to_{{ zone.name }}
 {%  if (fw4.forward_policy() != "accept" && (zone.log & 1)): %}
