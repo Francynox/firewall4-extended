@@ -1,0 +1,385 @@
+Test redirect reflection_zone edge cases: multi-zone group expansion and family mismatch.
+
+-- Testcase --
+{%
+	include("./root/usr/share/firewall4/main.uc", {
+		getenv: function(varname) {
+			switch (varname) {
+			case 'ACTION':
+				return 'print';
+			}
+		}
+	})
+%}
+-- End --
+
+-- File uci/helpers.json --
+{}
+-- End --
+
+-- File fs/open~_sys_class_net_br-lan_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_br-guest_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_eth1_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_eth3_flags.txt --
+0x1103
+-- End --
+
+-- File ubus/network.interface~dump.json --
+{
+	"interface": [
+		{
+			"interface": "lan",
+			"up": true,
+			"l3_device": "br-lan",
+			"proto": "static",
+			"device": "br-lan",
+			"ipv4-address": [ { "address": "192.168.1.1", "mask": 24 } ],
+			"ipv6-address": [ { "address": "fd00::1", "mask": 64 } ],
+			"data": {}
+		},
+		{
+			"interface": "guest",
+			"up": true,
+			"l3_device": "br-guest",
+			"proto": "static",
+			"device": "br-guest",
+			"ipv4-address": [ { "address": "192.168.2.1", "mask": 24 } ],
+			"data": {}
+		},
+		{
+			"interface": "wan",
+			"up": true,
+			"l3_device": "eth1",
+			"proto": "dhcp",
+			"device": "eth1",
+			"ipv4-address": [ { "address": "10.11.12.194", "mask": 24 } ],
+			"ipv6-address": [ { "address": "2001:db8::194", "mask": 64 } ],
+			"data": {}
+		},
+		{
+			"interface": "dmz",
+			"up": true,
+			"l3_device": "eth3",
+			"proto": "static",
+			"device": "eth3",
+			"ipv4-address": [ { "address": "192.168.3.1", "mask": 24 } ],
+			"data": {}
+		}
+	]
+}
+-- End --
+
+-- File uci/firewall.json --
+{
+	"zone": [
+		{
+			"name": "wan",
+			"network": "wan",
+			"auto_helper": 0
+		},
+		{
+			"name": "lan",
+			"network": "lan",
+			"auto_helper": 0
+		},
+		{
+			"name": "guest",
+			"network": "guest",
+			"auto_helper": 0
+		},
+		{
+			"name": "dmz_v4",
+			"network": "dmz",
+			"family": "ipv4",
+			"auto_helper": 0
+		}
+	],
+	"zone_group": [
+		{
+			"name": "lan_group",
+			"zone": [ "lan", "guest" ]
+		}
+	],
+	"redirect": [
+		{
+			"name": "HTTP forward multi reflection",
+			"src": "wan",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": 80,
+			"dest_port": 8080,
+			"target": "dnat",
+			"dest_ip": "192.168.1.100",
+			"reflection_zone": [ "lan_group" ]
+		},
+		{
+			"name": "IPv6 redirect IPv4 reflection mismatch",
+			"src": "wan",
+			"dest": "lan",
+			"proto": "tcp",
+			"family": "ipv6",
+			"src_dport": 443,
+			"dest_port": 8443,
+			"target": "dnat",
+			"dest_ip": "fd00::100",
+			"reflection_zone": [ "dmz_v4" ]
+		}
+	]
+}
+-- End --
+
+-- Expect stderr --
+[!] Section @redirect[1] (IPv6 redirect IPv4 reflection mismatch) is restricted to IPv6 but referenced reflection zone is IPv4 only, skipping
+-- End --
+
+-- Expect stdout --
+table inet fw4
+flush table inet fw4
+
+table inet fw4 {
+	#
+	# Defines
+	#
+
+	define wan_devices = { "eth1" }
+	define wan_subnets = { 10.11.12.0/24, 2001:db8::/64 }
+
+	define lan_devices = { "br-lan" }
+	define lan_subnets = { 192.168.1.0/24, fd00::/64 }
+
+	define guest_devices = { "br-guest" }
+	define guest_subnets = { 192.168.2.0/24 }
+
+	define dmz_v4_devices = { "eth3" }
+	define dmz_v4_subnets = { 192.168.3.0/24 }
+
+
+	#
+	# User includes
+	#
+
+	include "/etc/nftables.d/*.nft"
+
+
+	#
+	# Filter rules
+	#
+
+	chain input {
+		type filter hook input priority filter; policy drop;
+
+		iif "lo" accept comment "!fw4: Accept traffic from loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle inbound flows"
+		iifname "eth1" jump input_wan comment "!fw4: Handle wan IPv4/IPv6 input traffic"
+		iifname "br-lan" jump input_lan comment "!fw4: Handle lan IPv4/IPv6 input traffic"
+		iifname "br-guest" jump input_guest comment "!fw4: Handle guest IPv4/IPv6 input traffic"
+		meta nfproto ipv4 iifname "eth3" jump input_dmz_v4 comment "!fw4: Handle dmz_v4 IPv4 input traffic"
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle forwarded flows"
+		iifname "eth1" jump forward_wan comment "!fw4: Handle wan IPv4/IPv6 forward traffic"
+		iifname "br-lan" jump forward_lan comment "!fw4: Handle lan IPv4/IPv6 forward traffic"
+		iifname "br-guest" jump forward_guest comment "!fw4: Handle guest IPv4/IPv6 forward traffic"
+		meta nfproto ipv4 iifname "eth3" jump forward_dmz_v4 comment "!fw4: Handle dmz_v4 IPv4 forward traffic"
+	}
+
+	chain output {
+		type filter hook output priority filter; policy drop;
+
+		oif "lo" accept comment "!fw4: Accept traffic towards loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle outbound flows"
+		oifname "eth1" jump output_wan comment "!fw4: Handle wan IPv4/IPv6 output traffic"
+		oifname "br-lan" jump output_lan comment "!fw4: Handle lan IPv4/IPv6 output traffic"
+		oifname "br-guest" jump output_guest comment "!fw4: Handle guest IPv4/IPv6 output traffic"
+		meta nfproto ipv4 oifname "eth3" jump output_dmz_v4 comment "!fw4: Handle dmz_v4 IPv4 output traffic"
+	}
+
+	chain prerouting {
+		type filter hook prerouting priority filter; policy accept;
+	}
+
+	chain handle_reject {
+		meta l4proto tcp reject with tcp reset comment "!fw4: Reject TCP traffic"
+		reject with icmpx type port-unreachable comment "!fw4: Reject any other traffic"
+	}
+
+	chain input_wan {
+		jump drop_from_wan
+	}
+
+	chain output_wan {
+		jump drop_to_wan
+	}
+
+	chain forward_wan {
+		ct status dnat ip daddr 192.168.1.100 tcp dport 8080 counter jump accept_to_lan comment "!fw4: HTTP forward multi reflection"
+		ct status dnat ip6 daddr fd00::100 tcp dport 8443 counter jump accept_to_lan comment "!fw4: IPv6 redirect IPv4 reflection mismatch"
+		jump drop_to_wan
+	}
+
+	chain drop_from_wan {
+		iifname "eth1" counter drop comment "!fw4: drop wan IPv4/IPv6 traffic"
+	}
+
+	chain drop_to_wan {
+		oifname "eth1" counter drop comment "!fw4: drop wan IPv4/IPv6 traffic"
+	}
+
+	chain input_lan {
+		jump drop_from_lan
+	}
+
+	chain output_lan {
+		jump drop_to_lan
+	}
+
+	chain forward_lan {
+		ct status dnat ip daddr 192.168.1.100 tcp dport 8080 counter jump accept_to_lan comment "!fw4: HTTP forward multi reflection (reflection)"
+		jump drop_to_lan
+	}
+
+	chain accept_to_lan {
+		oifname "br-lan" counter accept comment "!fw4: accept lan IPv4/IPv6 traffic"
+	}
+
+	chain drop_from_lan {
+		iifname "br-lan" counter drop comment "!fw4: drop lan IPv4/IPv6 traffic"
+	}
+
+	chain drop_to_lan {
+		oifname "br-lan" counter drop comment "!fw4: drop lan IPv4/IPv6 traffic"
+	}
+
+	chain input_guest {
+		jump drop_from_guest
+	}
+
+	chain output_guest {
+		jump drop_to_guest
+	}
+
+	chain forward_guest {
+		ct status dnat ip daddr 192.168.1.100 tcp dport 8080 counter jump accept_to_lan comment "!fw4: HTTP forward multi reflection (reflection)"
+		jump drop_to_guest
+	}
+
+	chain drop_from_guest {
+		iifname "br-guest" counter drop comment "!fw4: drop guest IPv4/IPv6 traffic"
+	}
+
+	chain drop_to_guest {
+		oifname "br-guest" counter drop comment "!fw4: drop guest IPv4/IPv6 traffic"
+	}
+
+	chain input_dmz_v4 {
+		jump drop_from_dmz_v4
+	}
+
+	chain output_dmz_v4 {
+		jump drop_to_dmz_v4
+	}
+
+	chain forward_dmz_v4 {
+		jump drop_to_dmz_v4
+	}
+
+	chain drop_from_dmz_v4 {
+		meta nfproto ipv4 iifname "eth3" counter drop comment "!fw4: drop dmz_v4 IPv4 traffic"
+	}
+
+	chain drop_to_dmz_v4 {
+		meta nfproto ipv4 oifname "eth3" counter drop comment "!fw4: drop dmz_v4 IPv4 traffic"
+	}
+
+
+	#
+	# NAT rules
+	#
+
+	chain dstnat {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "eth1" jump dstnat_wan comment "!fw4: Handle wan IPv4/IPv6 dstnat traffic"
+		iifname "br-lan" jump dstnat_lan comment "!fw4: Handle lan IPv4/IPv6 dstnat traffic"
+		iifname "br-guest" jump dstnat_guest comment "!fw4: Handle guest IPv4/IPv6 dstnat traffic"
+	}
+
+	chain srcnat {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "br-lan" jump srcnat_lan comment "!fw4: Handle lan IPv4/IPv6 srcnat traffic"
+		oifname "br-guest" jump srcnat_guest comment "!fw4: Handle guest IPv4/IPv6 srcnat traffic"
+	}
+
+	chain dstnat_wan {
+		meta nfproto ipv4 tcp dport 80 counter dnat 192.168.1.100:8080 comment "!fw4: HTTP forward multi reflection"
+		meta nfproto ipv6 tcp dport 443 counter dnat [fd00::100]:8443 comment "!fw4: IPv6 redirect IPv4 reflection mismatch"
+	}
+
+	chain dstnat_lan {
+		ip saddr 192.168.1.0/24 ip daddr 10.11.12.194 tcp dport 80 dnat 192.168.1.100:8080 comment "!fw4: HTTP forward multi reflection (reflection)"
+	}
+
+	chain srcnat_lan {
+		ip saddr 192.168.1.0/24 ip daddr 192.168.1.100 tcp dport 8080 snat 192.168.1.1 comment "!fw4: HTTP forward multi reflection (reflection)"
+	}
+
+	chain dstnat_guest {
+		ip saddr 192.168.2.0/24 ip daddr 10.11.12.194 tcp dport 80 dnat 192.168.1.100:8080 comment "!fw4: HTTP forward multi reflection (reflection)"
+	}
+
+	chain srcnat_guest {
+		ip saddr 192.168.2.0/24 ip daddr 192.168.1.100 tcp dport 8080 snat 192.168.2.1 comment "!fw4: HTTP forward multi reflection (reflection)"
+	}
+
+
+	#
+	# Raw rules (notrack)
+	#
+
+	chain raw_prerouting {
+		type filter hook prerouting priority raw; policy accept;
+	}
+
+	chain raw_output {
+		type filter hook output priority raw; policy accept;
+	}
+
+
+	#
+	# Mangle rules
+	#
+
+	chain mangle_prerouting {
+		type filter hook prerouting priority mangle; policy accept;
+	}
+
+	chain mangle_postrouting {
+		type filter hook postrouting priority mangle; policy accept;
+	}
+
+	chain mangle_input {
+		type filter hook input priority mangle; policy accept;
+	}
+
+	chain mangle_output {
+		type route hook output priority mangle; policy accept;
+	}
+
+	chain mangle_forward {
+		type filter hook forward priority mangle; policy accept;
+	}
+}
+-- End --

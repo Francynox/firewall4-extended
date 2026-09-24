@@ -1,0 +1,433 @@
+Testing zone group declarations, namespace validation, ubus loading,
+unknown member dropping, nested group rejection, and empty/disabled flagging.
+
+-- Testcase --
+{%
+	include("./root/usr/share/firewall4/main.uc", {
+		getenv: function(varname) {
+			switch (varname) {
+			case 'ACTION':
+				return 'print';
+			}
+		}
+	});
+
+	let fw4 = require("fw4");
+
+	// Verify valid named group
+	let trusted = fw4.get_zone_group("trusted");
+	if (!trusted)
+		die("trusted zone group missing\n");
+	if (trusted.enabled != true || trusted.empty != false)
+		die("trusted state invalid\n");
+	if (length(trusted.zones) != 1 || trusted.zones[0].name != "lan")
+		die("trusted member invalid\n");
+	if (trusted.description != "Trusted LAN network")
+		die("trusted description invalid\n");
+
+	// Verify valid anonymous group
+	let untrusted = fw4.get_zone_group("untrusted");
+	if (!untrusted || length(untrusted.zones) != 1 || untrusted.zones[0].name != "wan")
+		die("untrusted zone group invalid\n");
+
+	// Verify valid ubus group with multiple zones
+	let ubus_grp = fw4.get_zone_group("ubus_group");
+	if (!ubus_grp || length(ubus_grp.zones) != 2 || ubus_grp.zones[0].name != "lan" || ubus_grp.zones[1].name != "wan")
+		die("ubus_group zone group invalid\n");
+
+	// Verify multi zone group (list feature)
+	let multi = fw4.get_zone_group("multi_zone");
+	if (!multi || multi.empty != false || length(multi.zones) != 2)
+		die("multi_zone length invalid\n");
+	if (multi.zones[0].name != "lan" || multi.zones[1].name != "wan")
+		die("multi_zone member invalid\n");
+	if (length(multi.zone) != 2 || multi.zone[0] != "lan" || multi.zone[1] != "wan")
+		die("multi_zone zone invalid\n");
+
+	// Verify deduplication of repeated member zones
+	let dedup = fw4.get_zone_group("dedup_group");
+	if (!dedup || dedup.empty != false || length(dedup.zones) != 2)
+		die("dedup_group length invalid\n");
+	if (dedup.zones[0].name != "lan" || dedup.zones[1].name != "wan")
+		die("dedup_group member invalid\n");
+	if (length(dedup.zone) != 2 || dedup.zone[0] != "lan" || dedup.zone[1] != "wan")
+		die("dedup_group zone invalid\n");
+
+	// Verify collision with zone rejected
+	if (fw4.get_zone_group("lan"))
+		die("colliding zone group 'lan' should not exist\n");
+	if (fw4.get_zone_group("wan"))
+		die("colliding zone group 'wan' should not exist\n");
+
+	// Verify partial member dropping & retention
+	let partial = fw4.get_zone_group("partial");
+	if (!partial || partial.empty != false || length(partial.zones) != 1 || partial.zones[0].name != "lan")
+		die("partial zone group invalid\n");
+
+	let ubus_partial = fw4.get_zone_group("ubus_partial");
+	if (!ubus_partial || ubus_partial.empty != false || length(ubus_partial.zones) != 1 || ubus_partial.zones[0].name != "lan")
+		die("ubus_partial zone group invalid\n");
+
+	// Verify nested group rejection & retention of valid member
+	let nested = fw4.get_zone_group("nested_group");
+	if (!nested || nested.empty != false || length(nested.zones) != 1 || nested.zones[0].name != "lan")
+		die("nested_group invalid\n");
+
+	// Verify disabled group flagged empty
+	let disabled = fw4.get_zone_group("disabled_group");
+	if (!disabled || disabled.enabled != false || disabled.empty != true || length(disabled.zones) != 0)
+		die("disabled_group should be empty\n");
+
+	// Verify empty group flagged empty
+	let empty = fw4.get_zone_group("empty_group");
+	if (!empty || empty.empty != true || length(empty.zones) != 0)
+		die("empty_group should be empty\n");
+%}
+-- End --
+
+-- File uci/helpers.json --
+{}
+-- End --
+
+-- File fs/open~_sys_class_net_br-lan_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_pppoe-wan_flags.txt --
+0x1103
+-- End --
+
+-- File ubus/network.interface~dump.json --
+{
+	"interface": [
+		{
+			"interface": "lan",
+			"up": true,
+			"l3_device": "br-lan",
+			"proto": "static",
+			"device": "br-lan",
+			"ipv4-address": [ { "address": "192.168.1.1", "mask": 24 } ],
+			"data": {}
+		},
+		{
+			"interface": "wan",
+			"up": true,
+			"l3_device": "pppoe-wan",
+			"proto": "pppoe",
+			"device": "eth1",
+			"ipv4-address": [ { "address": "10.11.12.194", "mask": 24 } ],
+			"data": {}
+		}
+	]
+}
+-- End --
+
+-- File ubus/service~get_data~type-firewall.json --
+{
+	"svc1": {
+		"firewall": [
+			{
+				"type": "zone_group",
+				"name": "ubus_group",
+				"zone": [ "lan", "wan" ]
+			}
+		]
+	},
+	"svc2": {
+		"firewall": [
+			{
+				"type": "zone_group",
+				"name": "ubus_group",
+				"zone": [ "lan" ]
+			}
+		]
+	},
+	"svc3": {
+		"firewall": [
+			{
+				"type": "zone_group",
+				"name": "trusted",
+				"zone": [ "lan" ]
+			}
+		]
+	},
+	"svc4": {
+		"firewall": [
+			{
+				"type": "zone_group",
+				"name": "wan",
+				"zone": [ "wan" ]
+			}
+		]
+	},
+	"svc5": {
+		"firewall": [
+			{
+				"type": "zone_group",
+				"name": "ubus_partial",
+				"zone": [ "lan", "ghost_zone" ]
+			}
+		]
+	}
+}
+-- End --
+
+-- File uci/firewall.json --
+{
+	"defaults": [
+		{
+			"input": "ACCEPT",
+			"output": "ACCEPT",
+			"forward": "REJECT"
+		}
+	],
+	"zone": [
+		{
+			"name": "lan",
+			"input": "ACCEPT",
+			"output": "ACCEPT",
+			"forward": "ACCEPT",
+			"network": "lan"
+		},
+		{
+			"name": "wan",
+			"input": "REJECT",
+			"output": "ACCEPT",
+			"forward": "REJECT",
+			"masq": "1",
+			"network": "wan"
+		}
+	],
+	"zone_group": [
+		{
+			".name": "trusted",
+			"name": "trusted",
+			"description": "Trusted LAN network",
+			"zone": [ "lan" ]
+		},
+		{
+			"name": "untrusted",
+			"description": "Untrusted WAN network",
+			"zone": "wan"
+		},
+		{
+			"name": "lan",
+			"zone": [ "lan" ]
+		},
+		{
+			"name": "trusted",
+			"zone": [ "wan" ]
+		},
+		{
+			"name": "partial",
+			"zone": [ "lan", "unknown_zone" ]
+		},
+		{
+			"name": "nested_group",
+			"zone": [ "lan", "trusted" ]
+		},
+		{
+			"name": "disabled_group",
+			"enabled": "0",
+			"zone": [ "lan" ]
+		},
+		{
+			"name": "empty_group",
+			"zone": [ "nonexistent" ]
+		},
+		{
+			"name": "multi_zone",
+			"zone": [ "lan", "wan" ]
+		},
+		{
+			"name": "dedup_group",
+			"zone": [ "lan", "wan", "lan" ]
+		}
+	]
+}
+-- End --
+
+-- Expect stderr --
+[!] ubus:svc2 zone_group (ubus_group) has a duplicate name, ignoring section
+[!] ubus:svc3 zone_group (trusted) duplicates a uci zone group, ignoring section
+[!] ubus:svc4 zone_group (wan) has a duplicate name, ignoring section
+[!] ubus:svc5 zone_group (ubus_partial) references unknown zone 'ghost_zone'
+[!] Section @zone_group[2] (lan) has a duplicate name, ignoring section
+[!] Section @zone_group[3] (trusted) has a duplicate name, ignoring section
+[!] Section @zone_group[4] (partial) references unknown zone 'unknown_zone'
+[!] Section @zone_group[5] (nested_group) references nested zone group 'trusted'
+[!] Section @zone_group[6] (disabled_group) is disabled, ignoring section
+[!] Section @zone_group[7] (empty_group) references unknown zone 'nonexistent'
+-- End --
+
+-- Expect stdout --
+table inet fw4
+flush table inet fw4
+
+table inet fw4 {
+	#
+	# Defines
+	#
+
+	define lan_devices = { "br-lan" }
+	define lan_subnets = { 192.168.1.0/24 }
+
+	define wan_devices = { "pppoe-wan" }
+	define wan_subnets = { 10.11.12.0/24 }
+
+
+	#
+	# User includes
+	#
+
+	include "/etc/nftables.d/*.nft"
+
+
+	#
+	# Filter rules
+	#
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+
+		iif "lo" accept comment "!fw4: Accept traffic from loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle inbound flows"
+		iifname "br-lan" jump input_lan comment "!fw4: Handle lan IPv4/IPv6 input traffic"
+		iifname "pppoe-wan" jump input_wan comment "!fw4: Handle wan IPv4/IPv6 input traffic"
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle forwarded flows"
+		iifname "br-lan" jump forward_lan comment "!fw4: Handle lan IPv4/IPv6 forward traffic"
+		iifname "pppoe-wan" jump forward_wan comment "!fw4: Handle wan IPv4/IPv6 forward traffic"
+		jump handle_reject
+	}
+
+	chain output {
+		type filter hook output priority filter; policy accept;
+
+		oif "lo" accept comment "!fw4: Accept traffic towards loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle outbound flows"
+		oifname "br-lan" jump output_lan comment "!fw4: Handle lan IPv4/IPv6 output traffic"
+		oifname "pppoe-wan" jump output_wan comment "!fw4: Handle wan IPv4/IPv6 output traffic"
+	}
+
+	chain prerouting {
+		type filter hook prerouting priority filter; policy accept;
+		iifname "br-lan" jump helper_lan comment "!fw4: Handle lan IPv4/IPv6 helper assignment"
+	}
+
+	chain handle_reject {
+		meta l4proto tcp reject with tcp reset comment "!fw4: Reject TCP traffic"
+		reject with icmpx type port-unreachable comment "!fw4: Reject any other traffic"
+	}
+
+	chain input_lan {
+		jump accept_from_lan
+	}
+
+	chain output_lan {
+		jump accept_to_lan
+	}
+
+	chain forward_lan {
+		jump accept_to_lan
+	}
+
+	chain helper_lan {
+	}
+
+	chain accept_from_lan {
+		iifname "br-lan" counter accept comment "!fw4: accept lan IPv4/IPv6 traffic"
+	}
+
+	chain accept_to_lan {
+		oifname "br-lan" counter accept comment "!fw4: accept lan IPv4/IPv6 traffic"
+	}
+
+	chain input_wan {
+		jump reject_from_wan
+	}
+
+	chain output_wan {
+		jump accept_to_wan
+	}
+
+	chain forward_wan {
+		jump reject_to_wan
+	}
+
+	chain accept_to_wan {
+		meta nfproto ipv4 oifname "pppoe-wan" ct state invalid counter drop comment "!fw4: Prevent NAT leakage"
+		oifname "pppoe-wan" counter accept comment "!fw4: accept wan IPv4/IPv6 traffic"
+	}
+
+	chain reject_from_wan {
+		iifname "pppoe-wan" counter jump handle_reject comment "!fw4: reject wan IPv4/IPv6 traffic"
+	}
+
+	chain reject_to_wan {
+		oifname "pppoe-wan" counter jump handle_reject comment "!fw4: reject wan IPv4/IPv6 traffic"
+	}
+
+
+	#
+	# NAT rules
+	#
+
+	chain dstnat {
+		type nat hook prerouting priority dstnat; policy accept;
+	}
+
+	chain srcnat {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "pppoe-wan" jump srcnat_wan comment "!fw4: Handle wan IPv4/IPv6 srcnat traffic"
+	}
+
+	chain srcnat_wan {
+		meta nfproto ipv4 masquerade comment "!fw4: Masquerade IPv4 wan traffic"
+	}
+
+
+	#
+	# Raw rules (notrack)
+	#
+
+	chain raw_prerouting {
+		type filter hook prerouting priority raw; policy accept;
+	}
+
+	chain raw_output {
+		type filter hook output priority raw; policy accept;
+	}
+
+
+	#
+	# Mangle rules
+	#
+
+	chain mangle_prerouting {
+		type filter hook prerouting priority mangle; policy accept;
+	}
+
+	chain mangle_postrouting {
+		type filter hook postrouting priority mangle; policy accept;
+	}
+
+	chain mangle_input {
+		type filter hook input priority mangle; policy accept;
+	}
+
+	chain mangle_output {
+		type route hook output priority mangle; policy accept;
+	}
+
+	chain mangle_forward {
+		type filter hook forward priority mangle; policy accept;
+	}
+}
+-- End --
