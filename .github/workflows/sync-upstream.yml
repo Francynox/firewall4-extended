@@ -1,0 +1,27 @@
+name: Sync Upstream Mirror
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    name: Sync Upstream
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout upstream branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7s
+        with:
+          ref: upstream
+          fetch-depth: 0
+
+      - name: Fast-forward upstream branch
+        run: |
+          git remote add official https://github.com/openwrt/firewall4.git
+          git fetch official master
+          git merge --ff-only official/master
+          git push origin upstream
