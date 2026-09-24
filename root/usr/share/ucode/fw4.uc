@@ -666,7 +666,7 @@ return {
 						let device_scoped = (rulespec.type == 'rule' || rulespec.type == 'nat');
 						let rule = { ...rulespec };
 
-						if (rulespec.type != 'ipset' && rulespec.type != 'zone')
+						if (rulespec.type != 'ipset' && rulespec.type != 'zone' && rulespec.type != 'zone_group')
 							rule.name = `${source} ${rulespec.type || 'rule'} ${n}`;
 
 						// an empty device opts a rule or nat out of the interface pin
@@ -684,7 +684,7 @@ return {
 								rule.device = ifc.l3_device ?? ifc.device;
 						}
 
-						if (rulespec.type == 'zone')
+						if (rulespec.type == 'zone' || rulespec.type == 'zone_group')
 							rule[".source"] = source;
 
 						push(rules, rule);
@@ -711,7 +711,7 @@ return {
 					for (let rulespec in services[svcname].firewall) {
 						let rule = { ...rulespec };
 
-						if (rulespec.type == 'zone')
+						if (rulespec.type == 'zone' || rulespec.type == 'zone_group')
 							rule[".source"] = source;
 						else if (rulespec.type != 'ipset')
 							rule.name = `${source} ${rulespec.type || 'rule'} ${n}`;
@@ -730,7 +730,7 @@ return {
 						for (let rulespec in instance.firewall) {
 							let rule = { ...rulespec };
 
-							if (rulespec.type == 'zone')
+							if (rulespec.type == 'zone' || rulespec.type == 'zone_group')
 								rule[".source"] = source;
 							else if (rulespec.type != 'ipset')
 								rule.name = `${source} ${rulespec.type || 'rule'} ${n}`;
@@ -786,7 +786,7 @@ return {
 		// Warn about ubus rule specs of unknown type
 		//
 
-		let known_types = [ "ipset", "zone", "rule", "forwarding", "redirect", "nat" ];
+		let known_types = [ "ipset", "zone", "zone_group", "rule", "forwarding", "redirect", "nat" ];
 
 		for (let r in this.state.ubus_rules)
 			if (r.type && !(r.type in known_types))
@@ -810,6 +810,17 @@ return {
 		if (!this.state.zones) {
 			map(filter(this.state.ubus_rules, z => (z.type == "zone")), z => self.parse_zone(z));
 			this.cursor.foreach("firewall", "zone", z => self.parse_zone(z));
+		}
+
+
+		//
+		// Build list of zone groups
+		//
+
+		if (!this.state.zone_groups) {
+			this.state.zone_groups = [];
+			map(filter(this.state.ubus_rules, g => (g.type == "zone_group")), g => self.parse_zone_group(g));
+			this.cursor.foreach("firewall", "zone_group", g => self.parse_zone_group(g));
 		}
 
 
@@ -871,6 +882,7 @@ return {
 			if (fd) {
 				fd.write({
 					zones: this.state.zones,
+					zone_groups: this.state.zone_groups,
 					ipsets: this.state.ipsets,
 					networks: this.state.networks,
 					ubus_rules: this.state.ubus_rules,
@@ -1115,16 +1127,85 @@ return {
 		if (val == '*')
 			return { any: true };
 
-		for (let zone in this.state.zones) {
-			if (zone.name == val) {
-				return {
-					any: false,
-					zone: zone
-				};
-			}
+		let zone = this.get_zone(val);
+		if (zone) {
+			return {
+				any: false,
+				zone: zone
+			};
+		}
+
+		let group = this.get_zone_group(val);
+		if (group) {
+			return {
+				any: false,
+				group: group
+			};
 		}
 
 		return null;
+	},
+
+	resolve_zone_refs: function(refs, section) {
+		if (!refs)
+			return [ null ];
+
+		let resolved = [];
+		let seen = {};
+
+		for (let ref in to_array(refs)) {
+			if (ref.group) {
+				if (ref.group.empty) {
+					if (section)
+						this.warn_section(section, `references empty zone group '${ref.group.name}', skipping`);
+					continue;
+				}
+
+				for (let z in ref.group.zones) {
+					if (!seen[z.name]) {
+						seen[z.name] = true;
+						push(resolved, { any: false, zone: z, group: ref.group.name });
+					}
+				}
+			}
+			else if (ref.zone) {
+				if (!seen[ref.zone.name]) {
+					seen[ref.zone.name] = true;
+					push(resolved, { any: false, zone: ref.zone, group: null });
+				}
+			}
+			else if (ref.any) {
+				if (!seen["*"]) {
+					seen["*"] = true;
+					push(resolved, { any: true, zone: null, group: null });
+				}
+			}
+		}
+
+		return resolved;
+	},
+
+	zone_pair_context: function(src, dest) {
+		if (src?.group && dest?.group)
+			return (src.group == dest.group) ? src.group : `${src.group} -> ${dest.group}`;
+		if (src?.group)
+			return src.group;
+		if (dest?.group)
+			return dest.group;
+		return null;
+	},
+
+	format_rule_comment: function(base_name, src, dest, is_multi) {
+		let src_name = src ? (src.any ? "*" : src.zone?.name) : null;
+		let dest_name = dest ? (dest.any ? "*" : dest.zone?.name) : null;
+		let pair_str = (src_name && dest_name) ? `${src_name} -> ${dest_name}` : (src_name || dest_name);
+		let group_context = this.zone_pair_context(src, dest);
+
+		if (group_context)
+			return pair_str ? `${base_name} [${pair_str}] (${group_context})` : `${base_name} (${group_context})`;
+		if (is_multi && pair_str)
+			return `${base_name} [${pair_str}]`;
+		return base_name;
 	},
 
 	parse_device: function(val) {
@@ -2370,6 +2451,90 @@ return {
 		push(this.state.zones ||= [], zone);
 	},
 
+	get_zone: function(name) {
+		for (let zone in this.state.zones) {
+			if (zone.name == name)
+				return zone;
+		}
+
+		return null;
+	},
+
+	get_zone_group: function(name) {
+		for (let group in this.state.zone_groups) {
+			if (group.name == name)
+				return group;
+		}
+
+		return null;
+	},
+
+	parse_zone_group: function(data) {
+		let group = this.parse_options(data, {
+			enabled: [ "bool", "1" ],
+
+			name: [ "identifier", null, REQUIRED ],
+			description: [ "string" ],
+
+			zone: [ "string", null, PARSE_LIST ]
+		});
+
+		if (group === false) {
+			this.warn_section(data, "skipped due to invalid options");
+			return;
+		}
+
+		if (this.get_zone(group.name) || this.get_zone_group(group.name)) {
+			this.warn_section(data, "has a duplicate name, ignoring section");
+			return;
+		}
+
+		if (!data[".name"]) {
+			let uci_names = [];
+
+			this.cursor.foreach("firewall", "zone_group", s => push(uci_names, s.name));
+
+			if (index(uci_names, group.name) >= 0) {
+				this.warn_section(data, "duplicates a uci zone group, ignoring section");
+				return;
+			}
+		}
+
+		if (!group.enabled) {
+			this.warn_section(data, "is disabled, ignoring section");
+			group.zone = [];
+			group.zones = [];
+			group.empty = true;
+			push(this.state.zone_groups ||= [], group);
+			return;
+		}
+
+		let valid_zones = [];
+
+		for (let member in group.zone) {
+			if (this.get_zone_group(member)) {
+				this.warn_section(data, `references nested zone group '${member}'`);
+				continue;
+			}
+
+			let z = this.get_zone(member);
+
+			if (!z) {
+				this.warn_section(data, `references unknown zone '${member}'`);
+				continue;
+			}
+
+			if (!filter(valid_zones, vz => vz.name == z.name)?.[0])
+				push(valid_zones, z);
+		}
+
+		group.zone = map(valid_zones, z => z.name);
+		group.zones = valid_zones;
+		group.empty = (length(valid_zones) == 0);
+
+		push(this.state.zone_groups ||= [], group);
+	},
+
 	parse_forwarding: function(data) {
 		let fwd = this.parse_options(data, {
 			enabled: [ "bool", "1" ],
@@ -2377,8 +2542,8 @@ return {
 			name: [ "string" ],
 			family: [ "family" ],
 
-			src: [ "zone_ref", null, REQUIRED ],
-			dest: [ "zone_ref", null, REQUIRED ]
+			src: [ "zone_ref", null, REQUIRED | PARSE_LIST ],
+			dest: [ "zone_ref", null, REQUIRED | PARSE_LIST ]
 		});
 
 		if (fwd === false) {
@@ -2390,41 +2555,68 @@ return {
 			return;
 		}
 
-		let add_rule = (family, fwd) => {
-			let f = {
-				...fwd,
+		let sources = this.resolve_zone_refs(fwd.src, data);
+		let destinations = this.resolve_zone_refs(fwd.dest, data);
 
-				family: family,
-				proto: { any: true }
-			};
-
-			f.name ||= `Accept ${fwd.src.any ? "any" : fwd.src.zone.name} to ${fwd.dest.any ? "any" : fwd.dest.zone.name} ${family ? `${this.nfproto(family, true)} ` : ''}forwarding`;
-			f.chain = fwd.src.any ? "forward" : `forward_${fwd.src.zone.name}`;
-
-			if (fwd.dest.any)
-				f.target = "accept";
-			else
-				f.jump_chain = `accept_to_${fwd.dest.zone.name}`;
-
-			push(this.state.rules ||= [], f);
-		};
-
-
-		/* inherit family restrictions from related zones */
-		let family = infer_family(fwd.family, [
-			fwd.src?.zone, "source zone",
-			fwd.dest?.zone, "destination zone"
-		]);
-
-		if (type(family) == "string") {
-			this.warn_section(data, `${family}, skipping`);
+		if (!length(sources) || !length(destinations))
 			return;
+
+		let is_multi = (length(sources) > 1 || length(destinations) > 1);
+
+		for (let src in sources) {
+			for (let dest in destinations) {
+				/* Intra-zone self-forwarding omission (A -> A) */
+				if (src.zone?.name && src.zone.name == dest.zone?.name)
+					continue;
+
+				/* inherit family restrictions from related zones */
+				let family = infer_family(fwd.family, [
+					src.zone, "source zone",
+					dest.zone, "destination zone"
+				]);
+
+				if (type(family) == "string") {
+					this.warn_section(data, `${family}, skipping`);
+					continue;
+				}
+
+				let group_context = this.zone_pair_context(src, dest);
+				let src_name = src.any ? "any" : src.zone.name;
+				let dest_name = dest.any ? "any" : dest.zone.name;
+
+				let rule_name;
+				if (fwd.name) {
+					rule_name = this.format_rule_comment(fwd.name, src, dest, is_multi);
+				}
+				else {
+					if (group_context)
+						rule_name = `Accept ${src_name} to ${dest_name} ${family ? `${this.nfproto(family, true)} ` : ''}forwarding (${group_context})`;
+					else
+						rule_name = `Accept ${src_name} to ${dest_name} ${family ? `${this.nfproto(family, true)} ` : ''}forwarding`;
+				}
+
+				let f = {
+					...fwd,
+
+					name: rule_name,
+					family: family,
+					proto: { any: true },
+					src: { any: src.any, zone: src.zone },
+					dest: { any: dest.any, zone: dest.zone },
+					chain: src.any ? "forward" : `forward_${src.zone.name}`
+				};
+
+				if (dest.any)
+					f.target = "accept";
+				else
+					f.jump_chain = `accept_to_${dest.zone.name}`;
+
+				push(this.state.rules ||= [], f);
+
+				if (dest.zone)
+					dest.zone.dflags.accept = true;
+			}
 		}
-
-		add_rule(family, fwd);
-
-		if (fwd.dest.zone)
-			fwd.dest.zone.dflags.accept = true;
 	},
 
 	parse_rule: function(data) {
@@ -2435,8 +2627,8 @@ return {
 			_name: [ "string", null, DEPRECATED ],
 			family: [ "family" ],
 
-			src: [ "zone_ref" ],
-			dest: [ "zone_ref" ],
+			src: [ "zone_ref", null, PARSE_LIST ],
+			dest: [ "zone_ref", null, PARSE_LIST ],
 
 			device: [ "device", null, NO_INVERT ],
 			direction: [ "direction" ],
@@ -2491,7 +2683,16 @@ return {
 			return;
 		}
 
-		if (rule.target in ["helper", "notrack"] && (!rule.src || !rule.src.zone)) {
+		let sources = this.resolve_zone_refs(rule.src, data);
+		let destinations = this.resolve_zone_refs(rule.dest, data);
+
+		if (rule.src && !length(sources))
+			return;
+
+		if (rule.dest && !length(destinations))
+			return;
+
+		if (rule.target in ["helper", "notrack"] && (!rule.src || filter(sources, s => !s?.zone)?.[0])) {
 			this.warn_section(data, `must specify a source zone for target '${rule.target}'`);
 			return;
 		}
@@ -2538,13 +2739,19 @@ return {
 		}
 
 		let need_src_action_chain = (rule) => (rule.src?.zone?.log && rule.target != "accept");
+		let is_multi = (length(sources) > 1 || length(destinations) > 1);
 
-		let add_rule = (family, proto, saddrs, daddrs, sports, dports, icmptypes, icmpcodes, ipset, rule) => {
+		let add_rule = (family, proto, saddrs, daddrs, sports, dports, icmptypes, icmpcodes, ipset, rule, src, dest) => {
+			let rule_name = this.format_rule_comment(rule.name, src, dest, is_multi);
+
 			let r = {
 				...rule,
 
+				name: rule_name,
 				family: family,
 				proto: proto,
+				src: src ? { any: src.any, zone: src.zone } : null,
+				dest: dest ? { any: dest.any, zone: dest.zone } : null,
 				has_addrs: !!(saddrs[0] || saddrs[1] || saddrs[2] || daddrs[0] || daddrs[1] || daddrs[2]),
 				has_ports: !!(length(sports) || length(dports)),
 				saddrs_pos: map(saddrs[0], this.cidr),
@@ -2653,92 +2860,96 @@ return {
 			push(this.state.rules ||= [], r);
 		};
 
-		for (let proto in rule.proto) {
-			let sip, dip, sports, dports, itypes4, itypes6;
-			let family = rule.family;
+		for (let src in sources) {
+			for (let dest in destinations) {
+				for (let proto in rule.proto) {
+					let sip, dip, sports, dports, itypes4, itypes6;
+					let family = rule.family;
 
-			switch (proto.name) {
-			case "icmp":
-				itypes4 = filter(rule.icmp_type || [], family_is_ipv4);
-				itypes6 = filter(rule.icmp_type || [], family_is_ipv6);
-				break;
+					switch (proto.name) {
+					case "icmp":
+						itypes4 = filter(rule.icmp_type || [], family_is_ipv4);
+						itypes6 = filter(rule.icmp_type || [], family_is_ipv6);
+						break;
 
-			case "ipv6-icmp":
-				family = 6;
-				itypes6 = filter(rule.icmp_type || [], family_is_ipv6);
-				break;
+					case "ipv6-icmp":
+						family = 6;
+						itypes6 = filter(rule.icmp_type || [], family_is_ipv6);
+						break;
 
-			case "tcp":
-			case "udp":
-				sports = rule.src_port;
-				dports = rule.dest_port;
-				break;
-			}
-
-			sip = subnets_split_af(rule.src_ip);
-			dip = subnets_split_af(rule.dest_ip);
-
-			family = infer_family(family, [
-				ipset, "set match",
-				sip, "source IP",
-				dip, "destination IP",
-				rule.src?.zone, "source zone",
-				rule.dest?.zone, "destination zone",
-				rule.helper, "helper match",
-				rule.set_helper, "helper to set"
-			]);
-
-			if (type(family) == "string") {
-				this.warn_section(data, `${family}, skipping`);
-				continue;
-			}
-
-			let has_ipv4_specifics = (length(sip[0]) || length(dip[0]) || length(itypes4) || rule.dscp !== null);
-			let has_ipv6_specifics = (length(sip[1]) || length(dip[1]) || length(itypes6) || rule.dscp !== null);
-
-			/* if no family was configured, infer target family from IP addresses */
-			if (family === null) {
-				if (has_ipv4_specifics && !has_ipv6_specifics)
-					family = 4;
-				else if (has_ipv6_specifics && !has_ipv4_specifics)
-					family = 6;
-				else
-					family = 0;
-			}
-
-			/* check if there's no AF specific bits, in this case we can do an AF agnostic rule */
-			if (!family && rule.target != "dscp" && !has_ipv4_specifics && !has_ipv6_specifics) {
-				add_rule(0, proto, [], [], sports, dports, null, null, ipset, rule);
-			}
-
-			/* we need to emit one or two AF specific rules */
-			else {
-				if (family == 0 || family == 4) {
-					let icmp_types = filter(itypes4, i => (i.code_min == 0 && i.code_max == 0xFF));
-					let icmp_codes = filter(itypes4, i => (i.code_min != 0 || i.code_max != 0xFF));
-
-					for (let saddrs in subnets_group_by_masking(sip[0])) {
-						for (let daddrs in subnets_group_by_masking(dip[0])) {
-							if (length(icmp_types) || (!length(icmp_types) && !length(icmp_codes)))
-								add_rule(4, proto, saddrs, daddrs, sports, dports, icmp_types, null, ipset, rule);
-
-							if (length(icmp_codes))
-								add_rule(4, proto, saddrs, daddrs, sports, dports, null, icmp_codes, ipset, rule);
-						}
+					case "tcp":
+					case "udp":
+						sports = rule.src_port;
+						dports = rule.dest_port;
+						break;
 					}
-				}
 
-				if (family == 0 || family == 6) {
-					let icmp_types = filter(itypes6, i => (i.code_min == 0 && i.code_max == 0xFF));
-					let icmp_codes = filter(itypes6, i => (i.code_min != 0 || i.code_max != 0xFF));
+					sip = subnets_split_af(rule.src_ip);
+					dip = subnets_split_af(rule.dest_ip);
 
-					for (let saddrs in subnets_group_by_masking(sip[1])) {
-						for (let daddrs in subnets_group_by_masking(dip[1])) {
-							if (length(icmp_types) || (!length(icmp_types) && !length(icmp_codes)))
-								add_rule(6, proto, saddrs, daddrs, sports, dports, icmp_types, null, ipset, rule);
+					family = infer_family(family, [
+						ipset, "set match",
+						sip, "source IP",
+						dip, "destination IP",
+						src?.zone, "source zone",
+						dest?.zone, "destination zone",
+						rule.helper, "helper match",
+						rule.set_helper, "helper to set"
+					]);
 
-							if (length(icmp_codes))
-								add_rule(6, proto, saddrs, daddrs, sports, dports, null, icmp_codes, ipset, rule);
+					if (type(family) == "string") {
+						this.warn_section(data, `${family}, skipping`);
+						continue;
+					}
+
+					let has_ipv4_specifics = (length(sip[0]) || length(dip[0]) || length(itypes4) || rule.dscp !== null);
+					let has_ipv6_specifics = (length(sip[1]) || length(dip[1]) || length(itypes6) || rule.dscp !== null);
+
+					/* if no family was configured, infer target family from IP addresses */
+					if (family === null) {
+						if (has_ipv4_specifics && !has_ipv6_specifics)
+							family = 4;
+						else if (has_ipv6_specifics && !has_ipv4_specifics)
+							family = 6;
+						else
+							family = 0;
+					}
+
+					/* check if there's no AF specific bits, in this case we can do an AF agnostic rule */
+					if (!family && rule.target != "dscp" && !has_ipv4_specifics && !has_ipv6_specifics) {
+						add_rule(0, proto, [], [], sports, dports, null, null, ipset, rule, src, dest);
+					}
+
+					/* we need to emit one or two AF specific rules */
+					else {
+						if (family == 0 || family == 4) {
+							let icmp_types = filter(itypes4, i => (i.code_min == 0 && i.code_max == 0xFF));
+							let icmp_codes = filter(itypes4, i => (i.code_min != 0 || i.code_max != 0xFF));
+
+							for (let saddrs in subnets_group_by_masking(sip[0])) {
+								for (let daddrs in subnets_group_by_masking(dip[0])) {
+									if (length(icmp_types) || (!length(icmp_types) && !length(icmp_codes)))
+										add_rule(4, proto, saddrs, daddrs, sports, dports, icmp_types, null, ipset, rule, src, dest);
+
+									if (length(icmp_codes))
+										add_rule(4, proto, saddrs, daddrs, sports, dports, null, icmp_codes, ipset, rule, src, dest);
+								}
+							}
+						}
+
+						if (family == 0 || family == 6) {
+							let icmp_types = filter(itypes6, i => (i.code_min == 0 && i.code_max == 0xFF));
+							let icmp_codes = filter(itypes6, i => (i.code_min != 0 || i.code_max != 0xFF));
+
+							for (let saddrs in subnets_group_by_masking(sip[1])) {
+								for (let daddrs in subnets_group_by_masking(dip[1])) {
+									if (length(icmp_types) || (!length(icmp_types) && !length(icmp_codes)))
+										add_rule(6, proto, saddrs, daddrs, sports, dports, icmp_types, null, ipset, rule, src, dest);
+
+									if (length(icmp_codes))
+										add_rule(6, proto, saddrs, daddrs, sports, dports, null, icmp_codes, ipset, rule, src, dest);
+								}
+							}
 						}
 					}
 				}
@@ -2754,7 +2965,7 @@ return {
 			_name: [ "string", null, DEPRECATED ],
 			family: [ "family" ],
 
-			src: [ "zone_ref" ],
+			src: [ "zone_ref", null, PARSE_LIST ],
 			dest: [ "zone_ref" ],
 
 			ipset: [ "setmatch" ],
@@ -2807,6 +3018,11 @@ return {
 		}
 		else if (!redir.enabled) {
 			this.warn_section(data, "is disabled, ignoring section");
+			return;
+		}
+
+		if (redir.dest?.group) {
+			this.warn_section(data, "does not support zone groups for destination");
 			return;
 		}
 
@@ -2866,12 +3082,20 @@ return {
 			return false;
 		};
 
+		let sources = this.resolve_zone_refs(redir.src, data);
+		if (redir.src && !length(sources))
+			return;
+
 		if (redir.target == "dnat") {
 			if (!redir.src)
 				return this.warn_section(data, "has no source specified");
-			else if (redir.src.any)
-				return this.warn_section(data, "must not have source '*' for dnat target");
-			else if (redir.dest_ip && redir.dest_ip.invert)
+
+			for (let src in sources) {
+				if (src?.any)
+					return this.warn_section(data, "must not have source '*' for dnat target");
+			}
+
+			if (redir.dest_ip && redir.dest_ip.invert)
 				return this.warn_section(data, "must not specify a negated 'dest_ip' value");
 			else if (redir.dest_ip && length(filter(redir.dest_ip.addrs, a => a.bits == -1)))
 				return this.warn_section(data, "must not use non-contiguous masks in 'dest_ip'");
@@ -2882,10 +3106,18 @@ return {
 			if (!redir.dest_port)
 				redir.dest_port = redir.src_dport;
 
-			if (redir.helper)
-				redir.src.zone.dflags.helper = true;
+			for (let src in sources) {
+				if (redir.helper && src?.zone)
+					src.zone.dflags.helper = true;
 
-			redir.src.zone.dflags[redir.target] = true;
+				if (src?.zone)
+					src.zone.dflags[redir.target] = true;
+			}
+
+			if (redir.reflection && redir.reflection_src == "external" && length(sources) > 1) {
+				let first_zone_name = sources[0]?.zone?.name || "first";
+				this.warn_section(data, `reflection_src 'external' with multiple source zones maps reflection SNAT to '${first_zone_name}' (consider using 'internal')`);
+			}
 		}
 		else {
 			if (!redir.dest)
@@ -2906,6 +3138,8 @@ return {
 			redir.dest.zone.dflags[redir.target] = true;
 		}
 
+		let seen_reflection_dnat = {};
+
 		let is_local_addr = (addr) => {
 			if (!addr)
 				return true;
@@ -2923,12 +3157,19 @@ return {
 			return false;
 		};
 
-		let add_rule = (family, proto, saddrs, daddrs, raddrs, sport, dport, rport, ipset, reflection_redir) => {
+		let is_multi = length(sources) > 1;
+
+		let add_rule = (family, proto, saddrs, daddrs, raddrs, sport, dport, rport, ipset, reflection_redir, src) => {
+			let rule_name = reflection_redir ? reflection_redir.name : this.format_rule_comment(redir.name, src, redir.dest, is_multi);
+
 			let r = {
 				...(reflection_redir || redir),
 
+				name: rule_name,
 				family: family,
 				proto: proto,
+				src: reflection_redir ? reflection_redir.src : (src || redir.src),
+				dest: reflection_redir ? reflection_redir.dest : redir.dest,
 				has_addrs: !!(saddrs[0] || saddrs[1] || saddrs[2] || daddrs[0] || daddrs[1] || daddrs[2]),
 				has_ports: !!(sport || dport || rport),
 				saddrs_pos: map(saddrs[0], this.cidr),
@@ -3023,204 +3264,212 @@ return {
 			};
 		};
 
-		for (let proto in redir.proto) {
-			let sip, dip, rip, iip, eip, refip, sport, dport, rport;
-			let family = redir.family;
+		let rip_check = subnets_split_af(redir.dest_ip);
+		if (length(rip_check[0]) > 1 || length(rip_check[1]) > 1)
+			this.warn_section(data, "specifies multiple rewrite addresses, using only first one");
 
-			if (proto.name == "ipv6-icmp")
-				family = 6;
+		for (let src in sources) {
+			for (let proto in redir.proto) {
+				let sip, dip, rip, sport, dport, rport;
+				let family = redir.family;
 
-			switch (redir.target) {
-			case "dnat":
-				sip = subnets_split_af(redir.src_ip);
-				dip = subnets_split_af(redir.src_dip);
-				rip = subnets_split_af(redir.dest_ip);
+				if (proto.name == "ipv6-icmp")
+					family = 6;
 
-				switch (proto.name) {
-				case "tcp":
-				case "udp":
-					sport = redir.src_port;
-					dport = redir.src_dport;
-					rport = redir.dest_port;
-					break;
-				}
+				switch (redir.target) {
+				case "dnat":
+					sip = subnets_split_af(redir.src_ip);
+					dip = subnets_split_af(redir.src_dip);
+					rip = subnets_split_af(redir.dest_ip);
 
-				break;
-
-			case "snat":
-				sip = subnets_split_af(redir.src_ip);
-				dip = subnets_split_af(redir.dest_ip);
-				rip = subnets_split_af(redir.src_dip);
-
-				switch (proto.name) {
-				case "tcp":
-				case "udp":
-					sport = redir.src_port;
-					dport = redir.dest_port;
-					rport = redir.src_dport;
-					break;
-				}
-
-				break;
-			}
-
-			family = infer_family(family, [
-				ipset, "set match",
-				sip, "source IP",
-				dip, "destination IP",
-				rip, "rewrite IP",
-				redir.src?.zone, "source zone",
-				redir.dest?.zone, "destination zone",
-				redir.helper, "helper match"
-			]);
-
-			if (type(family) == "string") {
-				this.warn_section(data, `${family}, skipping`);
-				continue;
-			}
-
-			/* build reflection rules */
-			if (redir.target == "dnat" && redir.reflection &&
-			    (length(rip[0]) || length(rip[1])) && redir.src?.zone && redir.dest?.zone) {
-				let refredir = {
-					name: `${redir.name} (reflection)`,
-
-					helper: redir.helper,
-
-					// XXX: this likely makes no sense for reflection rules
-					//src_mac: redir.src_mac,
-
-					limit: redir.limit,
-					limit_burst: redir.limit_burst,
-
-					start_date: redir.start_date,
-					stop_date: redir.stop_date,
-					start_time: redir.start_time,
-					stop_time: redir.stop_time,
-					weekdays: redir.weekdays,
-
-					mark: redir.mark,
-					filter_rule: false
-				};
-
-				let eaddrs = length(dip) ? dip : subnets_split_af({ addrs: map(redir.src.zone.related_subnets, to_hostaddr) });
-				let rzones = length(redir.reflection_zone) ? redir.reflection_zone : [ redir.dest ];
-
-				for (let rzone in rzones) {
-					if (!is_family(rzone, family)) {
-						this.warn_section(data,
-							`is restricted to IPv${family} but referenced reflection zone is IPv${rzone.family} only, skipping`);
-						continue;
+					switch (proto.name) {
+					case "tcp":
+					case "udp":
+						sport = redir.src_port;
+						dport = redir.src_dport;
+						rport = redir.dest_port;
+						break;
 					}
 
-					let iaddrs = subnets_split_af({ addrs: rzone.zone.related_subnets });
-					let refaddrs = (redir.reflection_src == "internal") ? iaddrs : eaddrs;
+					break;
 
-					for (let i = 0; i <= 1; i++) {
-						if (length(rip[i])) {
-							let snat_addr = refaddrs[i]?.[0];
+				case "snat":
+					sip = subnets_split_af(redir.src_ip);
+					dip = subnets_split_af(redir.dest_ip);
+					rip = subnets_split_af(redir.src_dip);
 
-							/* For internal reflection sources try to find a suitable candiate IP
-							 * among the reflection zone subnets which is within the same subnet
-							 * as the original DNAT destination. If we can't find any matching
-							 * one then simply take the first candidate. */
-							if (redir.reflection_src == "internal") {
-								for (let zone_addr in rzone.zone.related_subnets) {
-									if (zone_addr.family != rip[i][0].family)
-										continue;
+					switch (proto.name) {
+					case "tcp":
+					case "udp":
+						sport = redir.src_port;
+						dport = redir.dest_port;
+						rport = redir.src_dport;
+						break;
+					}
 
-									let r = apply_mask(rip[i][0].addr, zone_addr.mask);
-									let a = apply_mask(zone_addr.addr, zone_addr.mask);
+					break;
+				}
 
-									if (r != a)
-										continue;
+				family = infer_family(family, [
+					ipset, "set match",
+					sip, "source IP",
+					dip, "destination IP",
+					rip, "rewrite IP",
+					src?.zone, "source zone",
+					redir.dest?.zone, "destination zone",
+					redir.helper, "helper match"
+				]);
 
-									snat_addr = zone_addr;
-									break;
+				if (type(family) == "string") {
+					this.warn_section(data, `${family}, skipping`);
+					continue;
+				}
+
+				/* build reflection rules */
+				if (redir.target == "dnat" && redir.reflection &&
+				    (length(rip[0]) || length(rip[1])) && src?.zone && redir.dest?.zone) {
+					let refredir = {
+						name: `${redir.name} (reflection)`,
+						helper: redir.helper,
+
+						// XXX: this likely makes no sense for reflection rules
+						//src_mac: redir.src_mac,
+						limit: redir.limit,
+						limit_burst: redir.limit_burst,
+						start_date: redir.start_date,
+						stop_date: redir.stop_date,
+						start_time: redir.start_time,
+						stop_time: redir.stop_time,
+						weekdays: redir.weekdays,
+						mark: redir.mark,
+						filter_rule: false
+					};
+
+					let eaddrs = length(dip) ? dip : subnets_split_af({ addrs: map(src.zone.related_subnets, to_hostaddr) });
+					let rzones = length(redir.reflection_zone) ? this.resolve_zone_refs(redir.reflection_zone, data) : [ redir.dest ];
+
+					for (let rzone in rzones) {
+						if (!is_family(rzone.zone, family)) {
+							this.warn_section(data,
+								`is restricted to IPv${family} but referenced reflection zone is IPv${rzone.zone.family} only, skipping`);
+							continue;
+						}
+
+						let iaddrs = subnets_split_af({ addrs: rzone.zone.related_subnets });
+						let refaddrs = (redir.reflection_src == "internal") ? iaddrs : eaddrs;
+
+						for (let i = 0; i <= 1; i++) {
+							if (length(rip[i])) {
+								let snat_addr = refaddrs[i]?.[0];
+
+								/* For internal reflection sources try to find a suitable candiate IP
+								 * among the reflection zone subnets which is within the same subnet
+								 * as the original DNAT destination. If we can't find any matching
+								 * one then simply take the first candidate. */
+								if (redir.reflection_src == "internal") {
+									for (let zone_addr in rzone.zone.related_subnets) {
+										if (zone_addr.family != rip[i][0].family)
+											continue;
+
+										let r = apply_mask(rip[i][0].addr, zone_addr.mask);
+										let a = apply_mask(zone_addr.addr, zone_addr.mask);
+
+										if (r != a)
+											continue;
+
+										snat_addr = zone_addr;
+										break;
+									}
 								}
-							}
 
-							if (!snat_addr) {
-								this.warn_section(data, `${redir.reflection_src || "external"} rewrite IP cannot be determined, disabling reflection`);
-							}
-							else if (!length(iaddrs[i])) {
-								this.warn_section(data, "internal address range cannot be determined, disabling reflection");
-							}
-							else if (!length(eaddrs[i])) {
-								this.warn_section(data, "external address range cannot be determined, disabling reflection");
-							}
-							else {
-								refredir.src = rzone;
-								refredir.dest = null;
-								refredir.target = "dnat";
+								if (!snat_addr) {
+									this.warn_section(data, `${redir.reflection_src || "external"} rewrite IP cannot be determined, disabling reflection`);
+								}
+								else if (!length(iaddrs[i])) {
+									this.warn_section(data, "internal address range cannot be determined, disabling reflection");
+								}
+								else if (!length(eaddrs[i])) {
+									this.warn_section(data, "external address range cannot be determined, disabling reflection");
+								}
+								else {
+									refredir.src = rzone;
+									refredir.dest = null;
+									refredir.target = "dnat";
 
-								for (let saddrs in subnets_group_by_masking(iaddrs[i]))
-									for (let daddrs in subnets_group_by_masking(eaddrs[i]))
-										add_rule(i ? 6 : 4, proto, saddrs, daddrs, rip[i], sport, dport, rport, null, refredir);
+									for (let saddrs in subnets_group_by_masking(iaddrs[i])) {
+										for (let daddrs in subnets_group_by_masking(eaddrs[i])) {
+											let dnat_key = sprintf("%J", [ rzone.zone.name, i, proto.name, saddrs, daddrs ]);
+											if (seen_reflection_dnat[dnat_key])
+												continue;
+											seen_reflection_dnat[dnat_key] = true;
 
-								refredir.src = null;
-								refredir.dest = rzone;
-								refredir.target = "snat";
+											add_rule(i ? 6 : 4, proto, saddrs, daddrs, rip[i], sport, dport, rport, null, refredir, null);
+										}
+									}
 
-								for (let daddrs in subnets_group_by_masking(rip[i]))
-									for (let saddrs in subnets_group_by_masking(iaddrs[i]))
-										add_rule(i ? 6 : 4, proto, saddrs, daddrs, [ to_hostaddr(snat_addr) ], null, rport, null, null, refredir);
+									if (src == sources[0]) {
+										refredir.src = null;
+										refredir.dest = rzone;
+										refredir.target = "snat";
 
-								if (redir.filter_rule) {
-									let is_local = is_local_addr(rip[i][0]);
+										for (let daddrs in subnets_group_by_masking(rip[i]))
+											for (let saddrs in subnets_group_by_masking(iaddrs[i]))
+												add_rule(i ? 6 : 4, proto, saddrs, daddrs, [ to_hostaddr(snat_addr) ], null, rport, null, null, refredir, null);
 
-									for (let saddrs in (is_local ? subnets_group_by_masking(iaddrs[i]) : [ null ])) {
-										this.create_dnat_filter_rule(redir, {
-											name: `${redir.name} (reflection)`,
-											is_local: is_local,
-											src_zone: rzone.zone,
-											dest_zone: redir.dest?.zone,
+										if (redir.filter_rule) {
+											let is_local = is_local_addr(rip[i][0]);
 
-											family: i ? 6 : 4,
-											proto: proto,
+											for (let saddrs in (is_local ? subnets_group_by_masking(iaddrs[i]) : [ null ])) {
+												this.create_dnat_filter_rule(redir, {
+													name: `${redir.name} (reflection)`,
+													is_local: is_local,
+													src_zone: rzone.zone,
+													dest_zone: redir.dest?.zone,
 
-											saddrs_pos: saddrs?.[0] ? map(saddrs[0], this.cidr) : null,
-											daddrs_pos: map(rip[i], this.cidr),
-											dports_pos: map(filter_pos(to_array(rport)), this.port),
-											dports_neg: map(filter_neg(to_array(rport)), this.port),
-											ipset: null
-										});
+													family: i ? 6 : 4,
+													proto: proto,
+
+													saddrs_pos: saddrs?.[0] ? map(saddrs[0], this.cidr) : null,
+													daddrs_pos: map(rip[i], this.cidr),
+													dports_pos: map(filter_pos(to_array(rport)), this.port),
+													dports_neg: map(filter_neg(to_array(rport)), this.port),
+													ipset: null
+												});
+											}
+										}
 									}
 								}
 							}
 						}
 					}
 				}
-			}
 
-			if (length(rip[0]) > 1 || length(rip[1]) > 1)
-				this.warn_section(data, "specifies multiple rewrite addresses, using only first one");
+				let has_ip4_addr = length(sip[0]) || length(dip[0]) || length(rip[0]),
+				    has_ip6_addr = length(sip[1]) || length(dip[1]) || length(rip[1]),
+				    has_any_addr = has_ip4_addr || has_ip6_addr;
 
-			let has_ip4_addr = length(sip[0]) || length(dip[0]) || length(rip[0]),
-			    has_ip6_addr = length(sip[1]) || length(dip[1]) || length(rip[1]),
-			    has_any_addr = has_ip4_addr || has_ip6_addr;
+				/* check if there's no AF specific bits, in this case we can do an AF agnostic rule */
+				if (!family && !has_any_addr) {
+					/* for backwards compatibility, treat unspecified family as IPv4 unless user explicitly requested any (0) */
+					if (family == null)
+						family = 4;
 
-			/* check if there's no AF specific bits, in this case we can do an AF agnostic rule */
-			if (!family && !has_any_addr) {
-				/* for backwards compatibility, treat unspecified family as IPv4 unless user explicitly requested any (0) */
-				if (family == null)
-					family = 4;
-
-				add_rule(family, proto, [], [], null, sport, dport, rport, ipset, redir);
-			}
-
-			/* we need to emit one or two AF specific rules */
-			else {
-				if ((!family || family == 4) && (!has_any_addr || has_ip4_addr)) {
-					for (let saddrs in subnets_group_by_masking(sip[0]))
-						for (let daddrs in subnets_group_by_masking(dip[0]))
-							add_rule(4, proto, saddrs, daddrs, rip[0], sport, dport, rport, ipset, redir);
+					add_rule(family, proto, [], [], null, sport, dport, rport, ipset, null, src);
 				}
 
-				if ((!family || family == 6) && (!has_any_addr || has_ip6_addr)) {
-					for (let saddrs in subnets_group_by_masking(sip[1]))
-						for (let daddrs in subnets_group_by_masking(dip[1]))
-							add_rule(6, proto, saddrs, daddrs, rip[1], sport, dport, rport, ipset, redir);
+				/* we need to emit one or two AF specific rules */
+				else {
+					if ((!family || family == 4) && (!has_any_addr || has_ip4_addr)) {
+						for (let saddrs in subnets_group_by_masking(sip[0]))
+							for (let daddrs in subnets_group_by_masking(dip[0]))
+								add_rule(4, proto, saddrs, daddrs, rip[0], sport, dport, rport, ipset, null, src);
+					}
+
+					if ((!family || family == 6) && (!has_any_addr || has_ip6_addr)) {
+						for (let saddrs in subnets_group_by_masking(sip[1]))
+							for (let daddrs in subnets_group_by_masking(dip[1]))
+								add_rule(6, proto, saddrs, daddrs, rip[1], sport, dport, rport, ipset, null, src);
+					}
 				}
 			}
 		}
@@ -3233,7 +3482,8 @@ return {
 			name: [ "string", this.section_id(data[".name"]) ],
 			family: [ "family" ],
 
-			src: [ "zone_ref" ],
+			src: [ "zone_ref", null, PARSE_LIST ],
+			dest: [ "zone_ref", null, PARSE_LIST ],
 			device: [ "string" ],
 
 			ipset: [ "setmatch", null, UNSUPPORTED ],
@@ -3324,10 +3574,23 @@ return {
 			delete snat.log;
 		}
 
-		let add_rule = (family, proto, saddrs, daddrs, raddrs, sport, dport, rport, snat) => {
+		let sources = this.resolve_zone_refs(snat.src, data);
+		let destinations = this.resolve_zone_refs(snat.dest, data);
+
+		if ((snat.src && !length(sources)) || (snat.dest && !length(destinations)))
+			return;
+
+		let is_multi = (length(sources) > 1 || length(destinations) > 1);
+
+		let add_rule = (family, proto, saddrs, daddrs, raddrs, sport, dport, rport, snat, src, dest) => {
+			let rule_name = this.format_rule_comment(snat.name, src, dest, is_multi);
+
+			let target_zone = dest?.zone || src?.zone;
+
 			let n = {
 				...snat,
 
+				name: rule_name,
 				family: family,
 				proto: proto,
 				has_addrs: !!(saddrs[0] || saddrs[1] || saddrs[2] || daddrs[0] || daddrs[1] || daddrs[2]),
@@ -3346,82 +3609,97 @@ return {
 				raddr: raddrs ? raddrs[0] : null,
 				rport: rport,
 
-				chain: snat.src?.zone ? `srcnat_${snat.src.zone.name}` : "srcnat"
+				chain: target_zone ? `srcnat_${target_zone.name}` : "srcnat"
 			};
+
+			/* If an explicit dest zone was provided, src.zone represents the ingress source */
+			if (dest?.zone && src?.zone)
+				n.iifnames = null_if_empty(src.zone.match_devices);
 
 			push(this.state.redirects ||= [], n);
 		};
 
-		for (let proto in snat.proto) {
-			let sip, dip, rip, sport, dport, rport;
-			let family = snat.family;
+		let rip_check = subnets_split_af(snat.snat_ip);
+		if (length(rip_check[0]) > 1 || length(rip_check[1]) > 1)
+			this.warn_section(data, "specifies multiple rewrite addresses, using only first one");
 
-			sip = subnets_split_af(snat.src_ip);
-			dip = subnets_split_af(snat.dest_ip);
-			rip = subnets_split_af(snat.snat_ip);
+		for (let src in sources) {
+			for (let dest in destinations) {
+				/* Intra-zone self-NAT omission (A -> A) */
+				if (src?.zone && dest?.zone && src.zone.name == dest.zone.name)
+					continue;
 
-			switch (proto.name) {
-			case "tcp":
-			case "udp":
-				sport = snat.src_port;
-				dport = snat.dest_port;
-				rport = snat.snat_port;
-				break;
+				let nat_zone = dest?.zone || src?.zone;
+				if (nat_zone)
+					nat_zone.dflags.snat = true;
 
-			case "icmp":
-				rport = snat.snat_port;
-				break;
+				for (let proto in snat.proto) {
+					let sip, dip, rip, sport, dport, rport;
+					let family = snat.family;
 
-			case "ipv6-icmp":
-				family = 6;
-				rport = snat.snat_port;
-				break;
-			}
+					sip = subnets_split_af(snat.src_ip);
+					dip = subnets_split_af(snat.dest_ip);
+					rip = subnets_split_af(snat.snat_ip);
 
-			if (length(rip[0]) > 1 || length(rip[1]) > 1)
-				this.warn_section(data, "specifies multiple rewrite addresses, using only first one");
+					switch (proto.name) {
+					case "tcp":
+					case "udp":
+						sport = snat.src_port;
+						dport = snat.dest_port;
+						rport = snat.snat_port;
+						break;
 
-			family = infer_family(family, [
-				sip, "source IP",
-				dip, "destination IP",
-				rip, "rewrite IP",
-				snat.src?.zone, "source zone"
-			]);
+					case "icmp":
+						rport = snat.snat_port;
+						break;
 
-			if (type(family) == "string") {
-				this.warn_section(data, `${family}, skipping`);
-				continue;
-			}
+					case "ipv6-icmp":
+						family = 6;
+						rport = snat.snat_port;
+						break;
+					}
 
-			if (snat.src?.zone)
-				snat.src.zone.dflags.snat = true;
+					family = infer_family(family, [
+						sip, "source IP",
+						dip, "destination IP",
+						rip, "rewrite IP",
+						src?.zone, "source zone",
+						dest?.zone, "destination zone"
+					]);
 
-			/* if no family was configured, infer target family from IP addresses */
-			if (family === null) {
-				if ((length(sip[0]) || length(dip[0]) || length(rip[0])) && !length(sip[1]) && !length(dip[1]) && !length(rip[1]))
-					family = 4;
-				else if ((length(sip[1]) || length(dip[1]) || length(rip[1])) && !length(sip[0]) && !length(dip[0]) && !length(rip[0]))
-					family = 6;
-				else
-					family = 4; /* default to IPv4 only for backwards compatibility, unless an explict family any was configured */
-			}
+					if (type(family) == "string") {
+						this.warn_section(data, `${family}, skipping`);
+						continue;
+					}
 
-			/* check if there's no AF specific bits, in this case we can do an AF agnostic rule */
-			if (!family && !length(sip[0]) && !length(sip[1]) && !length(dip[0]) && !length(dip[1]) && !length(rip[0]) && !length(rip[1])) {
-				add_rule(0, proto, [], [], null, sport, dport, rport, snat);
-			}
+					/* if no family was configured, infer target family from IP addresses */
+					if (family === null) {
+						if ((length(sip[0]) || length(dip[0]) || length(rip[0])) && !length(sip[1]) && !length(dip[1]) && !length(rip[1]))
+							family = 4;
+						else if ((length(sip[1]) || length(dip[1]) || length(rip[1])) && !length(sip[0]) && !length(dip[0]) && !length(rip[0]))
+							family = 6;
+						else
+							family = 4; /* default to IPv4 only for backwards compatibility, unless an explict family any was configured */
+					}
 
-			/* we need to emit one or two AF specific rules */
-			else {
-				if (family == 0 || family == 4)
-					for (let saddr in subnets_group_by_masking(sip[0]))
-						for (let daddr in subnets_group_by_masking(dip[0]))
-							add_rule(4, proto, saddr, daddr, rip[0], sport, dport, rport, snat);
+					/* check if there's no AF specific bits, in this case we can do an AF agnostic rule */
+					if (!family && !length(sip[0]) && !length(sip[1]) && !length(dip[0]) && !length(dip[1]) && !length(rip[0]) && !length(rip[1])) {
+						add_rule(0, proto, [], [], null, sport, dport, rport, snat, src, dest);
+					}
 
-				if (family == 0 || family == 6)
-					for (let saddr in subnets_group_by_masking(sip[1]))
-						for (let daddr in subnets_group_by_masking(dip[1]))
-							add_rule(6, proto, saddr, daddr, rip[1], sport, dport, rport, snat);
+					/* we need to emit one or two AF specific rules */
+					else {
+						if (family == 0 || family == 4)
+							for (let saddr in subnets_group_by_masking(sip[0]))
+								for (let daddr in subnets_group_by_masking(dip[0]))
+									add_rule(4, proto, saddr, daddr, rip[0], sport, dport, rport, snat, src, dest);
+
+						if (family == 0 || family == 6)
+							for (let saddr in subnets_group_by_masking(sip[1]))
+								for (let daddr in subnets_group_by_masking(dip[1]))
+									add_rule(6, proto, saddr, daddr, rip[1], sport, dport, rport, snat, src, dest);
+					}
+				}
 			}
 		}
 	},

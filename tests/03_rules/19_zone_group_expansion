@@ -1,0 +1,383 @@
+Testing zone group rule expansion across forward, input, output, notrack, and log.
+
+-- Testcase --
+{%
+	include("./root/usr/share/firewall4/main.uc", {
+		getenv: function(varname) {
+			switch (varname) {
+			case 'ACTION':
+				return 'print';
+			}
+		}
+	})
+%}
+-- End --
+
+-- File uci/helpers.json --
+{}
+-- End --
+
+-- File fs/open~_sys_class_net_eth0_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_eth1_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_eth2_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_eth3_flags.txt --
+0x1103
+-- End --
+
+-- File uci/firewall.json --
+{
+	"zone": [
+		{
+			"name": "lan",
+			"forward": "DROP",
+			"device": [ "eth0" ],
+			"auto_helper": 0
+		},
+		{
+			"name": "dmz",
+			"forward": "DROP",
+			"device": [ "eth1" ],
+			"auto_helper": 0
+		},
+		{
+			"name": "wan",
+			"forward": "REJECT",
+			"device": [ "eth2" ],
+			"auto_helper": 0
+		},
+		{
+			"name": "wan6",
+			"forward": "REJECT",
+			"device": [ "eth3" ],
+			"auto_helper": 0
+		}
+	],
+
+	"zone_group": [
+		{
+			"name": "trusted",
+			"zone": [ "lan", "dmz" ]
+		},
+		{
+			"name": "wans",
+			"zone": [ "wan", "wan6" ]
+		},
+		{
+			"name": "empty_group",
+			"zone": [ "nonexistent" ]
+		}
+	],
+
+	"rule": [
+		{
+			"name": "Bypass-CT",
+			"src": "trusted",
+			"proto": "tcp",
+			"dest_port": "80",
+			"target": "notrack"
+		},
+		{
+			"name": "Allow-DNS",
+			"src": "trusted",
+			"proto": "udp",
+			"dest_port": "53",
+			"target": "accept"
+		},
+		{
+			"name": "Allow-SSH-LAN-Only",
+			"src": "lan",
+			"proto": "tcp",
+			"dest_port": "22",
+			"target": "accept"
+		},
+		{
+			"name": "Allow-NTP",
+			"src": "trusted",
+			"proto": "udp",
+			"dest_port": "123",
+			"target": "accept"
+		},
+		{
+			"name": "Drop-BadTraffic",
+			"src": "trusted",
+			"dest": "wans",
+			"proto": "tcp",
+			"dest_port": "4444",
+			"target": "drop",
+			"log": "1"
+		},
+		{
+			"name": "Allow-Outbound-NTP",
+			"dest": "wans",
+			"proto": "udp",
+			"dest_port": "123",
+			"target": "accept"
+		},
+		{
+			"name": "Empty-Rule",
+			"src": "empty_group",
+			"target": "accept"
+		}
+	]
+}
+-- End --
+
+-- Expect stderr --
+[!] Section @zone_group[2] (empty_group) references unknown zone 'nonexistent'
+[!] Section @rule[6] (Empty-Rule) references empty zone group 'empty_group', skipping
+-- End --
+
+-- Expect stdout --
+table inet fw4
+flush table inet fw4
+
+table inet fw4 {
+	#
+	# Defines
+	#
+
+	define lan_devices = { "eth0" }
+	define lan_subnets = {  }
+
+	define dmz_devices = { "eth1" }
+	define dmz_subnets = {  }
+
+	define wan_devices = { "eth2" }
+	define wan_subnets = {  }
+
+	define wan6_devices = { "eth3" }
+	define wan6_subnets = {  }
+
+
+	#
+	# User includes
+	#
+
+	include "/etc/nftables.d/*.nft"
+
+
+	#
+	# Filter rules
+	#
+
+	chain input {
+		type filter hook input priority filter; policy drop;
+
+		iif "lo" accept comment "!fw4: Accept traffic from loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle inbound flows"
+		iifname "eth0" jump input_lan comment "!fw4: Handle lan IPv4/IPv6 input traffic"
+		iifname "eth1" jump input_dmz comment "!fw4: Handle dmz IPv4/IPv6 input traffic"
+		iifname "eth2" jump input_wan comment "!fw4: Handle wan IPv4/IPv6 input traffic"
+		iifname "eth3" jump input_wan6 comment "!fw4: Handle wan6 IPv4/IPv6 input traffic"
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle forwarded flows"
+		iifname "eth0" jump forward_lan comment "!fw4: Handle lan IPv4/IPv6 forward traffic"
+		iifname "eth1" jump forward_dmz comment "!fw4: Handle dmz IPv4/IPv6 forward traffic"
+		iifname "eth2" jump forward_wan comment "!fw4: Handle wan IPv4/IPv6 forward traffic"
+		iifname "eth3" jump forward_wan6 comment "!fw4: Handle wan6 IPv4/IPv6 forward traffic"
+	}
+
+	chain output {
+		type filter hook output priority filter; policy drop;
+
+		oif "lo" accept comment "!fw4: Accept traffic towards loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle outbound flows"
+		oifname "eth0" jump output_lan comment "!fw4: Handle lan IPv4/IPv6 output traffic"
+		oifname "eth1" jump output_dmz comment "!fw4: Handle dmz IPv4/IPv6 output traffic"
+		oifname "eth2" jump output_wan comment "!fw4: Handle wan IPv4/IPv6 output traffic"
+		oifname "eth3" jump output_wan6 comment "!fw4: Handle wan6 IPv4/IPv6 output traffic"
+	}
+
+	chain prerouting {
+		type filter hook prerouting priority filter; policy accept;
+	}
+
+	chain handle_reject {
+		meta l4proto tcp reject with tcp reset comment "!fw4: Reject TCP traffic"
+		reject with icmpx type port-unreachable comment "!fw4: Reject any other traffic"
+	}
+
+	chain input_lan {
+		udp dport 53 counter accept comment "!fw4: Allow-DNS [lan] (trusted)"
+		tcp dport 22 counter accept comment "!fw4: Allow-SSH-LAN-Only"
+		udp dport 123 counter accept comment "!fw4: Allow-NTP [lan] (trusted)"
+		jump drop_from_lan
+	}
+
+	chain output_lan {
+		jump drop_to_lan
+	}
+
+	chain forward_lan {
+		tcp dport 4444 counter log prefix "Drop-BadTraffic: " jump drop_to_wan comment "!fw4: Drop-BadTraffic [lan -> wan] (trusted -> wans)"
+		tcp dport 4444 counter log prefix "Drop-BadTraffic: " jump drop_to_wan6 comment "!fw4: Drop-BadTraffic [lan -> wan6] (trusted -> wans)"
+		jump drop_to_lan
+	}
+
+	chain drop_from_lan {
+		iifname "eth0" counter drop comment "!fw4: drop lan IPv4/IPv6 traffic"
+	}
+
+	chain drop_to_lan {
+		oifname "eth0" counter drop comment "!fw4: drop lan IPv4/IPv6 traffic"
+	}
+
+	chain input_dmz {
+		udp dport 53 counter accept comment "!fw4: Allow-DNS [dmz] (trusted)"
+		udp dport 123 counter accept comment "!fw4: Allow-NTP [dmz] (trusted)"
+		jump drop_from_dmz
+	}
+
+	chain output_dmz {
+		jump drop_to_dmz
+	}
+
+	chain forward_dmz {
+		tcp dport 4444 counter log prefix "Drop-BadTraffic: " jump drop_to_wan comment "!fw4: Drop-BadTraffic [dmz -> wan] (trusted -> wans)"
+		tcp dport 4444 counter log prefix "Drop-BadTraffic: " jump drop_to_wan6 comment "!fw4: Drop-BadTraffic [dmz -> wan6] (trusted -> wans)"
+		jump drop_to_dmz
+	}
+
+	chain drop_from_dmz {
+		iifname "eth1" counter drop comment "!fw4: drop dmz IPv4/IPv6 traffic"
+	}
+
+	chain drop_to_dmz {
+		oifname "eth1" counter drop comment "!fw4: drop dmz IPv4/IPv6 traffic"
+	}
+
+	chain input_wan {
+		jump drop_from_wan
+	}
+
+	chain output_wan {
+		udp dport 123 counter jump accept_to_wan comment "!fw4: Allow-Outbound-NTP [wan] (wans)"
+		jump drop_to_wan
+	}
+
+	chain forward_wan {
+		jump reject_to_wan
+	}
+
+	chain accept_to_wan {
+		oifname "eth2" counter accept comment "!fw4: accept wan IPv4/IPv6 traffic"
+	}
+
+	chain reject_to_wan {
+		oifname "eth2" counter jump handle_reject comment "!fw4: reject wan IPv4/IPv6 traffic"
+	}
+
+	chain drop_from_wan {
+		iifname "eth2" counter drop comment "!fw4: drop wan IPv4/IPv6 traffic"
+	}
+
+	chain drop_to_wan {
+		oifname "eth2" counter drop comment "!fw4: drop wan IPv4/IPv6 traffic"
+	}
+
+	chain input_wan6 {
+		jump drop_from_wan6
+	}
+
+	chain output_wan6 {
+		udp dport 123 counter jump accept_to_wan6 comment "!fw4: Allow-Outbound-NTP [wan6] (wans)"
+		jump drop_to_wan6
+	}
+
+	chain forward_wan6 {
+		jump reject_to_wan6
+	}
+
+	chain accept_to_wan6 {
+		oifname "eth3" counter accept comment "!fw4: accept wan6 IPv4/IPv6 traffic"
+	}
+
+	chain reject_to_wan6 {
+		oifname "eth3" counter jump handle_reject comment "!fw4: reject wan6 IPv4/IPv6 traffic"
+	}
+
+	chain drop_from_wan6 {
+		iifname "eth3" counter drop comment "!fw4: drop wan6 IPv4/IPv6 traffic"
+	}
+
+	chain drop_to_wan6 {
+		oifname "eth3" counter drop comment "!fw4: drop wan6 IPv4/IPv6 traffic"
+	}
+
+
+	#
+	# NAT rules
+	#
+
+	chain dstnat {
+		type nat hook prerouting priority dstnat; policy accept;
+	}
+
+	chain srcnat {
+		type nat hook postrouting priority srcnat; policy accept;
+	}
+
+
+	#
+	# Raw rules (notrack)
+	#
+
+	chain raw_prerouting {
+		type filter hook prerouting priority raw; policy accept;
+		iifname "eth0" jump notrack_lan comment "!fw4: Handle lan IPv4/IPv6 notrack traffic"
+		iifname "eth1" jump notrack_dmz comment "!fw4: Handle dmz IPv4/IPv6 notrack traffic"
+	}
+
+	chain raw_output {
+		type filter hook output priority raw; policy accept;
+	}
+
+	chain notrack_lan {
+		tcp dport 80 counter notrack comment "!fw4: Bypass-CT [lan] (trusted)"
+	}
+
+	chain notrack_dmz {
+		tcp dport 80 counter notrack comment "!fw4: Bypass-CT [dmz] (trusted)"
+	}
+
+
+	#
+	# Mangle rules
+	#
+
+	chain mangle_prerouting {
+		type filter hook prerouting priority mangle; policy accept;
+	}
+
+	chain mangle_postrouting {
+		type filter hook postrouting priority mangle; policy accept;
+	}
+
+	chain mangle_input {
+		type filter hook input priority mangle; policy accept;
+	}
+
+	chain mangle_output {
+		type route hook output priority mangle; policy accept;
+	}
+
+	chain mangle_forward {
+		type filter hook forward priority mangle; policy accept;
+	}
+}
+-- End --

@@ -4,6 +4,8 @@
 	meta l4proto {{
 		(redirect.proto.name == 'icmp' && redirect.family == 6) ? 'ipv6-icmp' : redirect.proto.name
 	}} {%+ endif -%}
+{%+ if (redirect.iifnames): -%}
+	iifname {{ fw4.set(redirect.iifnames) }} {%+ endif -%}
 {%+ if (redirect.device): -%}
 	oifname {{ fw4.quote(redirect.device, true) }} {%+ endif -%}
 {%+ if (redirect.saddrs_pos): -%}

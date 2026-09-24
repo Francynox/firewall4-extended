@@ -1,0 +1,447 @@
+Test zone group expansion in redirects and NAT.
+
+-- Testcase --
+{%
+	include("./root/usr/share/firewall4/main.uc", {
+		getenv: function(varname) {
+			switch (varname) {
+			case 'ACTION':
+				return 'print';
+			}
+		}
+	})
+%}
+-- End --
+
+-- File uci/helpers.json --
+{}
+-- End --
+
+-- File fs/open~_sys_class_net_br-lan_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_eth1_flags.txt --
+0x1103
+-- End --
+
+-- File fs/open~_sys_class_net_eth2_flags.txt --
+0x1103
+-- End --
+
+-- File ubus/network.interface~dump.json --
+{
+	"interface": [
+		{
+			"interface": "lan",
+			"up": true,
+			"l3_device": "br-lan",
+			"proto": "static",
+			"device": "br-lan",
+			"ipv4-address": [ { "address": "192.168.1.1", "mask": 24 } ],
+			"data": {}
+		},
+		{
+			"interface": "wan",
+			"up": true,
+			"l3_device": "eth1",
+			"proto": "dhcp",
+			"device": "eth1",
+			"ipv4-address": [ { "address": "10.11.12.194", "mask": 24 } ],
+			"data": {}
+		},
+		{
+			"interface": "wan2",
+			"up": true,
+			"l3_device": "eth2",
+			"proto": "dhcp",
+			"device": "eth2",
+			"ipv4-address": [ { "address": "10.22.33.44", "mask": 24 } ],
+			"data": {}
+		}
+	]
+}
+-- End --
+
+-- File uci/firewall.json --
+{
+	"defaults": [
+		{
+			"input": "ACCEPT",
+			"output": "ACCEPT",
+			"forward": "REJECT"
+		}
+	],
+	"zone": [
+		{
+			"name": "lan",
+			"network": "lan",
+			"input": "ACCEPT",
+			"output": "ACCEPT",
+			"forward": "ACCEPT",
+			"auto_helper": 0
+		},
+		{
+			"name": "wan",
+			"network": "wan",
+			"input": "REJECT",
+			"output": "ACCEPT",
+			"forward": "REJECT",
+			"masq": 1,
+			"auto_helper": 0
+		},
+		{
+			"name": "wan2",
+			"network": "wan2",
+			"input": "REJECT",
+			"output": "ACCEPT",
+			"forward": "REJECT",
+			"masq": 1,
+			"auto_helper": 0
+		}
+	],
+	"zone_group": [
+		{
+			"name": "wan_group",
+			"zone": [ "wan", "wan2" ]
+		},
+		{
+			"name": "lan_group",
+			"zone": [ "lan" ]
+		}
+	],
+	"redirect": [
+		{
+			"name": "HTTP multi-WAN redirect",
+			"src": "wan_group",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": "80",
+			"dest_ip": "192.168.1.100",
+			"dest_port": "8080",
+			"target": "dnat",
+			"reflection": 1
+		},
+		{
+			"name": "SSH router redirection",
+			"src": "wan_group",
+			"proto": "tcp",
+			"src_dport": "2222",
+			"dest_port": "22",
+			"target": "dnat"
+		},
+		{
+			"name": "Multi-source list redirect",
+			"src": [ "wan", "wan2" ],
+			"dest": "lan",
+			"proto": "udp",
+			"src_dport": "5353",
+			"dest_ip": "192.168.1.200",
+			"dest_port": "53",
+			"target": "dnat",
+			"reflection": 1,
+			"reflection_src": "external"
+		},
+		{
+			"name": "HTTP reflection zone group",
+			"src": "wan",
+			"dest": "lan",
+			"proto": "tcp",
+			"src_dport": 80,
+			"dest_port": 8080,
+			"target": "dnat",
+			"dest_ip": "192.168.1.100",
+			"reflection_zone": [ "lan_group" ]
+		},
+		{
+			"name": "Invalid dest group redirect",
+			"src": "wan",
+			"dest": "lan_group",
+			"proto": "tcp",
+			"src_dport": "443",
+			"dest_ip": "192.168.1.100",
+			"target": "dnat"
+		}
+	],
+	"nat": [
+		{
+			"name": "Multi-WAN SNAT",
+			"src": "wan_group",
+			"proto": "tcp",
+			"target": "snat",
+			"snat_ip": "192.0.2.1",
+			"snat_port": "10000-20000"
+		},
+		{
+			"name": "Group pair SNAT",
+			"src": "lan_group",
+			"dest": "wan_group",
+			"proto": "udp",
+			"target": "snat",
+			"snat_ip": "192.0.2.2"
+		},
+		{
+			"name": "Intra-group SNAT",
+			"src": "wan_group",
+			"dest": "wan_group",
+			"proto": "icmp",
+			"target": "snat",
+			"snat_ip": "192.0.2.3"
+		}
+	]
+}
+-- End --
+
+-- Expect stderr --
+[!] Section @redirect[2] (Multi-source list redirect) reflection_src 'external' with multiple source zones maps reflection SNAT to 'wan' (consider using 'internal')
+[!] Section @redirect[4] (Invalid dest group redirect) does not support zone groups for destination
+-- End --
+
+-- Expect stdout --
+table inet fw4
+flush table inet fw4
+
+table inet fw4 {
+	#
+	# Defines
+	#
+
+	define lan_devices = { "br-lan" }
+	define lan_subnets = { 192.168.1.0/24 }
+
+	define wan_devices = { "eth1" }
+	define wan_subnets = { 10.11.12.0/24 }
+
+	define wan2_devices = { "eth2" }
+	define wan2_subnets = { 10.22.33.0/24 }
+
+
+	#
+	# User includes
+	#
+
+	include "/etc/nftables.d/*.nft"
+
+
+	#
+	# Filter rules
+	#
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+
+		iif "lo" accept comment "!fw4: Accept traffic from loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle inbound flows"
+		iifname "br-lan" jump input_lan comment "!fw4: Handle lan IPv4/IPv6 input traffic"
+		iifname "eth1" jump input_wan comment "!fw4: Handle wan IPv4/IPv6 input traffic"
+		iifname "eth2" jump input_wan2 comment "!fw4: Handle wan2 IPv4/IPv6 input traffic"
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle forwarded flows"
+		iifname "br-lan" jump forward_lan comment "!fw4: Handle lan IPv4/IPv6 forward traffic"
+		iifname "eth1" jump forward_wan comment "!fw4: Handle wan IPv4/IPv6 forward traffic"
+		iifname "eth2" jump forward_wan2 comment "!fw4: Handle wan2 IPv4/IPv6 forward traffic"
+		jump handle_reject
+	}
+
+	chain output {
+		type filter hook output priority filter; policy accept;
+
+		oif "lo" accept comment "!fw4: Accept traffic towards loopback"
+
+		ct state vmap { established : accept, related : accept } comment "!fw4: Handle outbound flows"
+		oifname "br-lan" jump output_lan comment "!fw4: Handle lan IPv4/IPv6 output traffic"
+		oifname "eth1" jump output_wan comment "!fw4: Handle wan IPv4/IPv6 output traffic"
+		oifname "eth2" jump output_wan2 comment "!fw4: Handle wan2 IPv4/IPv6 output traffic"
+	}
+
+	chain prerouting {
+		type filter hook prerouting priority filter; policy accept;
+	}
+
+	chain handle_reject {
+		meta l4proto tcp reject with tcp reset comment "!fw4: Reject TCP traffic"
+		reject with icmpx type port-unreachable comment "!fw4: Reject any other traffic"
+	}
+
+	chain input_lan {
+		jump accept_from_lan
+	}
+
+	chain output_lan {
+		jump accept_to_lan
+	}
+
+	chain forward_lan {
+		ct status dnat ip daddr 192.168.1.100 tcp dport 8080 counter jump accept_to_lan comment "!fw4: HTTP multi-WAN redirect (reflection)"
+		ct status dnat ip daddr 192.168.1.200 udp dport 53 counter jump accept_to_lan comment "!fw4: Multi-source list redirect (reflection)"
+		jump accept_to_lan
+	}
+
+	chain accept_from_lan {
+		iifname "br-lan" counter accept comment "!fw4: accept lan IPv4/IPv6 traffic"
+	}
+
+	chain accept_to_lan {
+		oifname "br-lan" counter accept comment "!fw4: accept lan IPv4/IPv6 traffic"
+	}
+
+	chain input_wan {
+		ct status dnat meta nfproto ipv4 tcp dport 22 counter accept comment "!fw4: SSH router redirection [wan] (wan_group)"
+		jump reject_from_wan
+	}
+
+	chain output_wan {
+		jump accept_to_wan
+	}
+
+	chain forward_wan {
+		ct status dnat ip daddr 192.168.1.100 tcp dport 8080 counter jump accept_to_lan comment "!fw4: HTTP multi-WAN redirect [wan -> lan] (wan_group)"
+		ct status dnat ip daddr 192.168.1.200 udp dport 53 counter jump accept_to_lan comment "!fw4: Multi-source list redirect [wan -> lan]"
+		jump reject_to_wan
+	}
+
+	chain accept_to_wan {
+		meta nfproto ipv4 oifname "eth1" ct state invalid counter drop comment "!fw4: Prevent NAT leakage"
+		oifname "eth1" counter accept comment "!fw4: accept wan IPv4/IPv6 traffic"
+	}
+
+	chain reject_from_wan {
+		iifname "eth1" counter jump handle_reject comment "!fw4: reject wan IPv4/IPv6 traffic"
+	}
+
+	chain reject_to_wan {
+		oifname "eth1" counter jump handle_reject comment "!fw4: reject wan IPv4/IPv6 traffic"
+	}
+
+	chain input_wan2 {
+		ct status dnat meta nfproto ipv4 tcp dport 22 counter accept comment "!fw4: SSH router redirection [wan2] (wan_group)"
+		jump reject_from_wan2
+	}
+
+	chain output_wan2 {
+		jump accept_to_wan2
+	}
+
+	chain forward_wan2 {
+		ct status dnat ip daddr 192.168.1.100 tcp dport 8080 counter jump accept_to_lan comment "!fw4: HTTP multi-WAN redirect [wan2 -> lan] (wan_group)"
+		ct status dnat ip daddr 192.168.1.200 udp dport 53 counter jump accept_to_lan comment "!fw4: Multi-source list redirect [wan2 -> lan]"
+		jump reject_to_wan2
+	}
+
+	chain accept_to_wan2 {
+		meta nfproto ipv4 oifname "eth2" ct state invalid counter drop comment "!fw4: Prevent NAT leakage"
+		oifname "eth2" counter accept comment "!fw4: accept wan2 IPv4/IPv6 traffic"
+	}
+
+	chain reject_from_wan2 {
+		iifname "eth2" counter jump handle_reject comment "!fw4: reject wan2 IPv4/IPv6 traffic"
+	}
+
+	chain reject_to_wan2 {
+		oifname "eth2" counter jump handle_reject comment "!fw4: reject wan2 IPv4/IPv6 traffic"
+	}
+
+
+	#
+	# NAT rules
+	#
+
+	chain dstnat {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "br-lan" jump dstnat_lan comment "!fw4: Handle lan IPv4/IPv6 dstnat traffic"
+		iifname "eth1" jump dstnat_wan comment "!fw4: Handle wan IPv4/IPv6 dstnat traffic"
+		iifname "eth2" jump dstnat_wan2 comment "!fw4: Handle wan2 IPv4/IPv6 dstnat traffic"
+	}
+
+	chain srcnat {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "br-lan" jump srcnat_lan comment "!fw4: Handle lan IPv4/IPv6 srcnat traffic"
+		oifname "eth1" jump srcnat_wan comment "!fw4: Handle wan IPv4/IPv6 srcnat traffic"
+		oifname "eth2" jump srcnat_wan2 comment "!fw4: Handle wan2 IPv4/IPv6 srcnat traffic"
+	}
+
+	chain dstnat_lan {
+		ip saddr 192.168.1.0/24 ip daddr 10.11.12.194 tcp dport 80 dnat 192.168.1.100:8080 comment "!fw4: HTTP multi-WAN redirect (reflection)"
+		ip saddr 192.168.1.0/24 ip daddr 10.22.33.44 tcp dport 80 dnat 192.168.1.100:8080 comment "!fw4: HTTP multi-WAN redirect (reflection)"
+		ip saddr 192.168.1.0/24 ip daddr 10.11.12.194 udp dport 5353 dnat 192.168.1.200:53 comment "!fw4: Multi-source list redirect (reflection)"
+		ip saddr 192.168.1.0/24 ip daddr 10.22.33.44 udp dport 5353 dnat 192.168.1.200:53 comment "!fw4: Multi-source list redirect (reflection)"
+		ip saddr 192.168.1.0/24 ip daddr 10.11.12.194 tcp dport 80 dnat 192.168.1.100:8080 comment "!fw4: HTTP reflection zone group (reflection)"
+	}
+
+	chain srcnat_lan {
+		ip saddr 192.168.1.0/24 ip daddr 192.168.1.100 tcp dport 8080 snat 192.168.1.1 comment "!fw4: HTTP multi-WAN redirect (reflection)"
+		ip saddr 192.168.1.0/24 ip daddr 192.168.1.200 udp dport 53 snat 10.11.12.194 comment "!fw4: Multi-source list redirect (reflection)"
+		ip saddr 192.168.1.0/24 ip daddr 192.168.1.100 tcp dport 8080 snat 192.168.1.1 comment "!fw4: HTTP reflection zone group (reflection)"
+	}
+
+	chain dstnat_wan {
+		meta nfproto ipv4 tcp dport 80 counter dnat 192.168.1.100:8080 comment "!fw4: HTTP multi-WAN redirect [wan -> lan] (wan_group)"
+		meta nfproto ipv4 tcp dport 2222 counter redirect to 22 comment "!fw4: SSH router redirection [wan] (wan_group)"
+		meta nfproto ipv4 udp dport 5353 counter dnat 192.168.1.200:53 comment "!fw4: Multi-source list redirect [wan -> lan]"
+		meta nfproto ipv4 tcp dport 80 counter dnat 192.168.1.100:8080 comment "!fw4: HTTP reflection zone group"
+	}
+
+	chain srcnat_wan {
+		meta nfproto ipv4 meta l4proto tcp counter snat 192.0.2.1:10000-20000 comment "!fw4: Multi-WAN SNAT [wan] (wan_group)"
+		meta nfproto ipv4 meta l4proto udp iifname "br-lan" counter snat 192.0.2.2 comment "!fw4: Group pair SNAT [lan -> wan] (lan_group -> wan_group)"
+		meta nfproto ipv4 meta l4proto icmp iifname "eth2" counter snat 192.0.2.3 comment "!fw4: Intra-group SNAT [wan2 -> wan] (wan_group)"
+		meta nfproto ipv4 masquerade comment "!fw4: Masquerade IPv4 wan traffic"
+	}
+
+	chain dstnat_wan2 {
+		meta nfproto ipv4 tcp dport 80 counter dnat 192.168.1.100:8080 comment "!fw4: HTTP multi-WAN redirect [wan2 -> lan] (wan_group)"
+		meta nfproto ipv4 tcp dport 2222 counter redirect to 22 comment "!fw4: SSH router redirection [wan2] (wan_group)"
+		meta nfproto ipv4 udp dport 5353 counter dnat 192.168.1.200:53 comment "!fw4: Multi-source list redirect [wan2 -> lan]"
+	}
+
+	chain srcnat_wan2 {
+		meta nfproto ipv4 meta l4proto tcp counter snat 192.0.2.1:10000-20000 comment "!fw4: Multi-WAN SNAT [wan2] (wan_group)"
+		meta nfproto ipv4 meta l4proto udp iifname "br-lan" counter snat 192.0.2.2 comment "!fw4: Group pair SNAT [lan -> wan2] (lan_group -> wan_group)"
+		meta nfproto ipv4 meta l4proto icmp iifname "eth1" counter snat 192.0.2.3 comment "!fw4: Intra-group SNAT [wan -> wan2] (wan_group)"
+		meta nfproto ipv4 masquerade comment "!fw4: Masquerade IPv4 wan2 traffic"
+	}
+
+
+	#
+	# Raw rules (notrack)
+	#
+
+	chain raw_prerouting {
+		type filter hook prerouting priority raw; policy accept;
+	}
+
+	chain raw_output {
+		type filter hook output priority raw; policy accept;
+	}
+
+
+	#
+	# Mangle rules
+	#
+
+	chain mangle_prerouting {
+		type filter hook prerouting priority mangle; policy accept;
+	}
+
+	chain mangle_postrouting {
+		type filter hook postrouting priority mangle; policy accept;
+	}
+
+	chain mangle_input {
+		type filter hook input priority mangle; policy accept;
+	}
+
+	chain mangle_output {
+		type route hook output priority mangle; policy accept;
+	}
+
+	chain mangle_forward {
+		type filter hook forward priority mangle; policy accept;
+	}
+}
+-- End --

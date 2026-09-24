@@ -91,24 +91,40 @@ function lookup_device(dev) {
 function lookup_zone(name, dev) {
 	let state = read_state();
 
+	let check_devices = (devices) => {
+		if (dev) {
+			if (dev in devices) {
+				print(dev, "\n");
+				exit(0);
+			}
+
+			exit(1);
+		}
+
+		if (length(devices))
+			print(join("\n", devices), "\n");
+
+		exit(0);
+	};
+
 	for (let zone in state.zones) {
 		if (zone.name == name) {
 			let devices = [];
 			map(zone.match_rules, (r) => push(devices, ...(r.devices_pos || [])));
+			check_devices(devices);
+		}
+	}
 
-			if (dev) {
-				if (dev in devices) {
-					print(dev, "\n");
-					exit(0);
-				}
+	for (let group in state.zone_groups) {
+		if (group.name == name) {
+			let devices = [];
 
-				exit(1);
+			for (let zone in state.zones) {
+				if (zone.name in group.zone)
+					map(zone.match_rules, (r) => push(devices, ...(r.devices_pos || [])));
 			}
 
-			if (length(devices))
-				print(join("\n", devices), "\n");
-
-			exit(0);
+			check_devices(uniq(devices));
 		}
 	}
 
