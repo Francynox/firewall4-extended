@@ -152,4 +152,4 @@ Run the full test suite locally (requires `ucode`):
 
 ## License
 
-ISC
+[ISC](LICENSE)
